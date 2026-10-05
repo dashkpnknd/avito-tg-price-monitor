@@ -33,6 +33,9 @@ class SheetSource:
     name: str
     spreadsheet_id: str
     gid: str
+    kind: str = "strict_price"
+    title_column: str = ""
+    price_column: str = ""
 
 
 @dataclass(frozen=True)
@@ -73,7 +76,16 @@ class Config:
             result: List[SheetSource] = []
             for value in values:
                 try:
-                    result.append(SheetSource(str(value["name"]), str(value["spreadsheet_id"]), str(value["gid"])))
+                    result.append(
+                        SheetSource(
+                            str(value["name"]),
+                            str(value["spreadsheet_id"]),
+                            str(value["gid"]),
+                            str(value.get("kind", "strict_price")),
+                            str(value.get("title_column", "")),
+                            str(value.get("price_column", "")),
+                        )
+                    )
                 except (KeyError, TypeError) as error:
                     raise MonitorError("Invalid entry in config.%s" % name) from error
             return tuple(result)
@@ -285,6 +297,10 @@ def product_key(source: str, row: int, parameters: Dict[str, str]) -> str:
 
 
 def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List[Product]:
+    if source.kind == "phone_cash":
+        return extract_phone_cash_products(source, rows)
+    if source.kind != "strict_price":
+        raise MonitorError("Unsupported client sheet kind %s for %s" % (source.kind, source.name))
     header_row = find_header_row(rows)
     if header_row is None:
         raise MonitorError("No Price header found in client sheet: %s" % source.name)
@@ -302,6 +318,84 @@ def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List
             if not any(parameters.values()):
                 continue
             products.append(Product(product_key(source.name, row_number, parameters), source.name, row_number, parameters, price))
+    return products
+
+
+COLOR_ALIASES = {
+    "black": "черный",
+    "white": "белый",
+    "pink": "розовый",
+    "green": "зеленый",
+    "yellow": "желтый",
+    "red": "красный",
+    "gray": "серый",
+    "grey": "серый",
+    "violet": "фиолетовый",
+    "purple": "фиолетовый",
+    "teal": "голубой",
+    "ultramarine": "голубой",
+    "midnight": "черный",
+    "starlight": "белый",
+    "dtitanium": "золотистый",
+    "ntitanium": "серый",
+}
+
+
+def phone_color(raw: str, model: str) -> str:
+    raw = normalized(raw)
+    if raw == "blue":
+        # The Avito templates call blue of ordinary iPhones "голубой" and
+        # blue of Pro models "синий".
+        generation = re.search(r"iphone(\d+)", normalized(model))
+        legacy_blue = generation is not None and int(generation.group(1)) <= 13
+        return "синий" if "pro" in normalized(model) or legacy_blue else "голубой"
+    return COLOR_ALIASES.get(raw, raw)
+
+
+def parse_phone_title(title: str) -> Optional[Dict[str, str]]:
+    """Turn LimeStore's compact title into the fields of an Avito phone row."""
+    value = re.sub(r"\s+", " ", title).strip()
+    if not value:
+        return None
+    tokens = value.split(" ")
+    color = tokens[-1]
+    without_color = " ".join(tokens[:-1])
+    memory_match = re.search(r"(?:/|\s)(\d{2,4})\s*(gb|гб|tb|тб)?$", without_color, re.IGNORECASE)
+    if not memory_match:
+        return None
+    amount, unit = memory_match.group(1), (memory_match.group(2) or "gb").casefold()
+    memory = str(int(amount) * 1024) + " гб" if unit in {"tb", "тб"} else str(int(amount)) + " гб"
+    model = without_color[: memory_match.start()].rstrip(" /,-")
+    if not model:
+        return None
+    if normalized(model).startswith("phone"):
+        model = "i" + model
+    if re.match(r"^\d", model):
+        model = "iPhone " + model
+    return {"model": model, "memorysize": memory, "color": phone_color(color, model)}
+
+
+def find_column(headers: Sequence[str], requested: str) -> Optional[int]:
+    wanted = normalized(requested)
+    return next((index for index, header in enumerate(headers) if normalized(header) == wanted), None)
+
+
+def extract_phone_cash_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List[Product]:
+    if not rows:
+        return []
+    headers = rows[0]
+    title_column = find_column(headers, source.title_column or "НОВЫЙ")
+    price_column = find_column(headers, source.price_column or "Lime Store Наличка")
+    if title_column is None or price_column is None:
+        raise MonitorError("Cash layout columns are missing in client sheet: %s" % source.name)
+    products: List[Product] = []
+    for row_number, row in enumerate(rows[1:], start=2):
+        title = cell(row, title_column)
+        price = parse_price(cell(row, price_column))
+        parameters = parse_phone_title(title)
+        if price is None or parameters is None:
+            continue
+        products.append(Product(product_key(source.name, row_number, parameters), source.name, row_number, parameters, price))
     return products
 
 

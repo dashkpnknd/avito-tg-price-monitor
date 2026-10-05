@@ -2,6 +2,14 @@
   "project_name": "LimeStore Гатчина",
   "client_sources": [
     {
+      "name": "Гатчина Новые eSIM — Наличка",
+      "spreadsheet_id": "CLIENT_SPREADSHEET_ID",
+      "gid": "1521261025",
+      "kind": "phone_cash",
+      "title_column": "НОВЫЙ",
+      "price_column": "Lime Store Наличка"
+    },
+    {
       "name": "Часы (авито)",
       "spreadsheet_id": "CLIENT_SPREADSHEET_ID",
       "gid": "350636096"
@@ -13,6 +21,11 @@
     }
   ],
   "autoload_sources": [
+    {
+      "name": "Avito - Мобильные телефоны",
+      "spreadsheet_id": "AUTOLOAD_SPREADSHEET_ID",
+      "gid": "974772936"
+    },
     {
       "name": "Avito - Смарт-часы",
       "spreadsheet_id": "AUTOLOAD_SPREADSHEET_ID",

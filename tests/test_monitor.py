@@ -6,6 +6,7 @@ from app.monitor import (
     SheetSource,
     extract_autoload_rows,
     extract_products,
+    parse_phone_title,
     product_matches,
 )
 
@@ -33,6 +34,16 @@ class MatchingTests(unittest.TestCase):
         parsed = extract_autoload_rows(SheetSource("Авито", "id", "gid"), rows)
         self.assertEqual("8479075727", parsed[0].ad_id)
         self.assertEqual(24990, parsed[0].price)
+
+    def test_parses_limestore_phone_title(self):
+        self.assertEqual(
+            {"model": "iPhone 16E", "memorysize": "128 гб", "color": "черный"},
+            parse_phone_title("iPhone 16E 128Gb black"),
+        )
+        self.assertEqual(
+            {"model": "iPhone 14 plus", "memorysize": "128 гб", "color": "голубой"},
+            parse_phone_title("14 plus 128 blue"),
+        )
 
 
 if __name__ == "__main__":
