@@ -1,0 +1,27 @@
+{
+  "project_name": "LimeStore Гатчина",
+  "client_sources": [
+    {
+      "name": "Часы (авито)",
+      "spreadsheet_id": "CLIENT_SPREADSHEET_ID",
+      "gid": "350636096"
+    },
+    {
+      "name": "Наушники (авито)",
+      "spreadsheet_id": "CLIENT_SPREADSHEET_ID",
+      "gid": "1751701963"
+    }
+  ],
+  "autoload_sources": [
+    {
+      "name": "Avito - Смарт-часы",
+      "spreadsheet_id": "AUTOLOAD_SPREADSHEET_ID",
+      "gid": "912716722"
+    },
+    {
+      "name": "Avito - Наушники",
+      "spreadsheet_id": "AUTOLOAD_SPREADSHEET_ID",
+      "gid": "140616984"
+    }
+  ]
+}

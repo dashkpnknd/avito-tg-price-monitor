@@ -1,0 +1,8 @@
+services:
+  avito-price-monitor:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
