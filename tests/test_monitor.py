@@ -6,6 +6,7 @@ from app.monitor import (
     SheetSource,
     extract_autoload_rows,
     extract_products,
+    notification_batches,
     parse_phone_title,
     product_matches,
 )
@@ -44,6 +45,11 @@ class MatchingTests(unittest.TestCase):
             {"model": "iPhone 14 plus", "memorysize": "128 гб", "color": "голубой"},
             parse_phone_title("14 plus 128 blue"),
         )
+
+    def test_splits_long_telegram_notification(self):
+        batches = notification_batches(["x" * 2000, "y" * 2000, "z" * 2000], "Заголовок", limit=3900)
+        self.assertEqual(3, len(batches))
+        self.assertTrue(all(len(batch) <= 3900 for batch in batches))
 
 
 if __name__ == "__main__":

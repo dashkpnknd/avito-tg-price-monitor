@@ -532,6 +532,22 @@ def send_telegram(config: Config, text: str) -> None:
         raise MonitorError("Telegram rejected notification")
 
 
+def notification_batches(messages: Iterable[str], heading: str, limit: int = 3900) -> List[str]:
+    """Keep multi-item alerts below Telegram's 4096-character limit."""
+    batches: List[str] = []
+    current = heading
+    for message in messages:
+        item = "\n\n──────────\n" + message
+        if len(current) + len(item) > limit and current != heading:
+            batches.append(current)
+            current = heading + item
+        else:
+            current += item
+    if current != heading:
+        batches.append(current)
+    return batches
+
+
 class Monitor:
     def __init__(self, config: Config):
         self.config = config
@@ -575,8 +591,7 @@ class Monitor:
         state = load_state(self.config.state_path)
         current = now_utc()
         current_keys = {issue.key for issue in issues}
-        sent = 0
-        resolved = 0
+        due: List[Tuple[Issue, Dict[str, str], timedelta]] = []
         for issue in issues:
             entry = state.get(issue.key)
             if not entry:
@@ -584,16 +599,26 @@ class Monitor:
                 state[issue.key] = entry
             elapsed = current - parse_timestamp(entry["first_seen"])
             if entry.get("notified") != "true" and elapsed >= self.config.mismatch_grace:
-                send_telegram(self.config, issue.message(elapsed))
-                entry["notified"] = "true"
-                sent += 1
+                due.append((issue, entry, elapsed))
+        for batch in notification_batches(
+            (issue.message(elapsed) for issue, _, elapsed in due),
+            "⚠️ Найдены расхождения цен (пакет уведомлений)",
+        ):
+            send_telegram(self.config, batch)
+        for _, entry, _ in due:
+            entry["notified"] = "true"
+        resolved_keys: List[str] = []
         for key in list(state):
             if key in current_keys:
                 continue
             entry = state[key]
             if entry.get("notified") == "true":
-                send_telegram(self.config, "✅ Расхождение цен устранено\nПроект: %s\nПроверка: %s" % (self.config.project_name, key))
-                resolved += 1
+                resolved_keys.append(key)
             del state[key]
+        for batch in notification_batches(
+            ("✅ Расхождение цен устранено\nПроект: %s\nПроверка: %s" % (self.config.project_name, key) for key in resolved_keys),
+            "✅ Устранены расхождения цен (пакет уведомлений)",
+        ):
+            send_telegram(self.config, batch)
         save_state(self.config.state_path, state)
-        return sent, resolved
+        return len(due), len(resolved_keys)
