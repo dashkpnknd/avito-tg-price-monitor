@@ -51,6 +51,17 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(3, len(batches))
         self.assertTrue(all(len(batch) <= 3900 for batch in batches))
 
+    def test_keeps_phone_title_for_a_readable_digest_without_matching_on_it(self):
+        rows = [["НОВЫЙ", "Lime Store Наличка"], ["iPhone 16E 128Gb black", "57 990"]]
+        product = extract_products(
+            SheetSource("Телефоны", "id", "gid", "phone_cash", "НОВЫЙ", "Lime Store Наличка"), rows
+        )[0]
+        matching = AutoloadRow(
+            "Авито", 2, {"model": "iPhone 16E", "memorysize": "128 ГБ", "color": "черный"}, 57490, "1", ""
+        )
+        self.assertEqual("iPhone 16E 128Gb black", product.title)
+        self.assertTrue(product_matches(product, matching))
+
 
 if __name__ == "__main__":
     unittest.main()

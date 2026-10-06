@@ -50,6 +50,7 @@ class Config:
     state_path: Path
     check_interval_minutes: int
     mismatch_grace: timedelta
+    notification_repeat: timedelta
     max_avito_pages: int
     dry_run: bool
 
@@ -101,6 +102,7 @@ class Config:
             state_path=Path(os.getenv("STATE_PATH", "data/state.json")),
             check_interval_minutes=positive_int("CHECK_INTERVAL_MINUTES", 60),
             mismatch_grace=timedelta(hours=positive_int("MISMATCH_GRACE_HOURS", 5)),
+            notification_repeat=timedelta(hours=positive_int("NOTIFICATION_REPEAT_HOURS", 24)),
             max_avito_pages=positive_int("MAX_AVITO_PAGES", 100),
             dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
         )
@@ -129,7 +131,7 @@ class Product:
 
     @property
     def title(self) -> str:
-        return self.parameters.get("title", "")
+        return self.parameters.get("title", "") or self.parameters.get("_display", "")
 
 
 @dataclass(frozen=True)
@@ -395,6 +397,9 @@ def extract_phone_cash_products(source: SheetSource, rows: Sequence[Sequence[str
         parameters = parse_phone_title(title)
         if price is None or parameters is None:
             continue
+        # Store the compact client title only for readable notifications.  It
+        # must not participate in the strict match against Avito's own title.
+        parameters["_display"] = title
         products.append(Product(product_key(source.name, row_number, parameters), source.name, row_number, parameters, price))
     return products
 
@@ -440,6 +445,8 @@ def strict_equal(left: str, right: str) -> bool:
 
 def product_matches(product: Product, row: AutoloadRow) -> bool:
     for name, value in product.parameters.items():
+        if name.startswith("_"):
+            continue
         if not value:
             continue
         if name not in row.parameters or not strict_equal(value, row.parameters[name]):
@@ -460,12 +467,37 @@ def get_avito_token(config: Config) -> str:
     return str(token)
 
 
+def avito_json(url: str, headers: Dict[str, str]) -> Dict[str, object]:
+    """Fetch an Avito response without turning a temporary rate limit into an alert storm."""
+    last_error: Optional[MonitorError] = None
+    for attempt in range(5):
+        try:
+            payload = json.loads(http_text(url, headers=headers))
+            if not isinstance(payload, dict):
+                raise MonitorError("Unexpected Avito response")
+            return payload
+        except (json.JSONDecodeError, MonitorError) as error:
+            last_error = error if isinstance(error, MonitorError) else MonitorError("Invalid JSON from Avito")
+            # The public API returns 429 occasionally when pages are requested
+            # too quickly.  Wait and retry rather than reporting every listing
+            # as absent.
+            if "HTTP 429" not in str(last_error) or attempt == 4:
+                raise last_error
+            retry_after = re.search(r"retry after\s*(\d+)", str(last_error), re.IGNORECASE)
+            time.sleep(min(int(retry_after.group(1)) if retry_after else 2 ** attempt, 30))
+    raise last_error or MonitorError("Avito request failed")
+
+
 def fetch_active_avito_items(config: Config) -> Dict[str, AvitoItem]:
     token = get_avito_token(config)
     headers = {"Authorization": "Bearer " + token}
     result: Dict[str, AvitoItem] = {}
     for page in range(1, config.max_avito_pages + 1):
-        payload = json.loads(http_text(AVITO_API + "/core/v1/items?page=" + str(page), headers=headers))
+        if page > 1:
+            # Keep the regular hourly scan well under the listing endpoint's
+            # burst limit.
+            time.sleep(1)
+        payload = avito_json(AVITO_API + "/core/v1/items?page=" + str(page), headers)
         resources = payload.get("resources", [])
         if not isinstance(resources, list):
             raise MonitorError("Unexpected Avito item list response")
@@ -548,6 +580,47 @@ def notification_batches(messages: Iterable[str], heading: str, limit: int = 390
     return batches
 
 
+def short_issue(issue: Issue) -> str:
+    """A readable sample line for a digest, not a verbose per-item alert."""
+    title = issue.product.title or format_parameters(issue.product.parameters)
+    return "%s — клиент %s, автозагрузка %s, Авито %s" % (
+        title,
+        format_price(issue.product.price),
+        format_price(issue.autoload.price if issue.autoload else None),
+        format_price(issue.avito.price if issue.avito else None),
+    )
+
+
+def issue_digest(project_name: str, issues: Sequence[Issue], grace: timedelta, checked_at: datetime) -> str:
+    """One compact project-level notification instead of a message per product."""
+    client_to_autoload = sum(
+        "цена не дошла из клиентской таблицы в автозагрузку" in issue.reasons for issue in issues
+    )
+    autoload_to_avito = sum(
+        "цена не дошла из автозагрузки в Авито" in issue.reasons for issue in issues
+    )
+    missing = sum(
+        any("не найдено" in reason or "нет ID" in reason or "не активно" in reason for reason in issue.reasons)
+        for issue in issues
+    )
+    lines = [
+        "⚠️ %s — требуется проверка цен" % project_name,
+        "Проверка: %s МСК" % checked_at.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m %H:%M"),
+        "Расхождения сохраняются более %s: %s поз." % (format_duration(grace), len(issues)),
+    ]
+    if client_to_autoload:
+        lines.append("• Клиентская таблица → автозагрузка: %s" % client_to_autoload)
+    if autoload_to_avito:
+        lines.append("• Автозагрузка → Авито: %s" % autoload_to_avito)
+    if missing:
+        lines.append("• Не найдена строка или активное объявление: %s" % missing)
+    if issues:
+        lines.append("\nПримеры для проверки:")
+        lines.extend("• " + short_issue(issue) for issue in issues[:3])
+    lines.append("\nЭто одна сводка по проекту, а не сообщения по каждому товару. Новые уведомления по нему будут приходить не чаще раза в сутки.")
+    return "\n".join(lines)
+
+
 class Monitor:
     def __init__(self, config: Config):
         self.config = config
@@ -590,6 +663,10 @@ class Monitor:
     def _notify(self, issues: Sequence[Issue]) -> Tuple[int, int]:
         state = load_state(self.config.state_path)
         current = now_utc()
+        meta = state.setdefault("__monitor__", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            state["__monitor__"] = meta
         current_keys = {issue.key for issue in issues}
         due: List[Tuple[Issue, Dict[str, str], timedelta]] = []
         for issue in issues:
@@ -600,25 +677,30 @@ class Monitor:
             elapsed = current - parse_timestamp(entry["first_seen"])
             if entry.get("notified") != "true" and elapsed >= self.config.mismatch_grace:
                 due.append((issue, entry, elapsed))
-        for batch in notification_batches(
-            (issue.message(elapsed) for issue, _, elapsed in due),
-            "⚠️ Найдены расхождения цен (пакет уведомлений)",
-        ):
-            send_telegram(self.config, batch)
-        for _, entry, _ in due:
-            entry["notified"] = "true"
+        last_digest_value = str(meta.get("last_digest_at", ""))
+        last_digest = parse_timestamp(last_digest_value) if last_digest_value else None
+        can_send_digest = last_digest is None or current - last_digest >= self.config.notification_repeat
+        alerts_sent = 0
+        if due and can_send_digest:
+            # A single digest represents the whole project.  Persist successful
+            # delivery immediately: the previous implementation waited until
+            # every long Telegram batch succeeded, so one 429 made it resend
+            # already delivered batches on every later scan.
+            send_telegram(self.config, issue_digest(self.config.project_name, issues, self.config.mismatch_grace, current))
+            for _, entry, _ in due:
+                entry["notified"] = "true"
+            meta["last_digest_at"] = current.isoformat()
+            save_state(self.config.state_path, state)
+            alerts_sent = 1
         resolved_keys: List[str] = []
         for key in list(state):
+            if key == "__monitor__":
+                continue
             if key in current_keys:
                 continue
             entry = state[key]
             if entry.get("notified") == "true":
                 resolved_keys.append(key)
             del state[key]
-        for batch in notification_batches(
-            ("✅ Расхождение цен устранено\nПроект: %s\nПроверка: %s" % (self.config.project_name, key) for key in resolved_keys),
-            "✅ Устранены расхождения цен (пакет уведомлений)",
-        ):
-            send_telegram(self.config, batch)
         save_state(self.config.state_path, state)
-        return len(due), len(resolved_keys)
+        return alerts_sent, len(resolved_keys)
