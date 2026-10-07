@@ -589,12 +589,16 @@ def notification_batches(messages: Iterable[str], heading: str, limit: int = 390
 def issue_example(issue: Issue) -> str:
     """A scan-friendly example card within a project digest."""
     title = issue.product.title or format_parameters(issue.product.parameters)
-    return "\n".join((
+    lines = [
         "<b>%s</b>" % html.escape(title),
         "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
         "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
         "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
-    ))
+    ]
+    url = (issue.autoload.url if issue.autoload and issue.autoload.url else issue.avito.url if issue.avito else "")
+    if url.startswith(("https://", "http://")):
+        lines.append('🔗 <a href="%s">Открыть объявление</a>' % html.escape(url, quote=True))
+    return "\n".join(lines)
 
 
 def position_word(count: int) -> str:
