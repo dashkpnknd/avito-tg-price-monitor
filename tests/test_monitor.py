@@ -72,6 +72,11 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual("Авито", issues[0].product.source_name)
         self.assertIn("не найдено в автозагрузке", issues[0].reasons[0])
 
+    def test_ignores_client_product_with_only_an_archived_autoload_row(self):
+        product = Product("key", "Клиент", 2, {"title": "Archived phone"}, 100)
+        archived = AutoloadRow("Автозагрузка", 5, {"title": "Archived phone"}, 100, "123", "")
+        self.assertEqual([], Monitor(None)._find_issues([product], [archived], {}))
+
 
 if __name__ == "__main__":
     unittest.main()

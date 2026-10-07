@@ -595,6 +595,12 @@ def issue_example(issue: Issue) -> str:
             "📥 Автозагрузка: <b>строка не найдена</b>",
             "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
         ))
+    elif issue.product.source_name == "Автозагрузка":
+        lines.extend((
+            "👤 Клиентская таблица: <b>цена не найдена</b>",
+            "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
+            "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
+        ))
     else:
         lines.extend((
             "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
@@ -670,13 +676,20 @@ class Monitor:
 
     def _find_issues(self, products: Sequence[Product], rows: Sequence[AutoloadRow], active: Dict[str, AvitoItem]) -> List[Issue]:
         issues: List[Issue] = []
+        matched_active_ids = set()
         for product in products:
             matched = [row for row in rows if product_matches(product, row)]
-            if not matched:
-                issues.append(Issue("%s:missing-autoload" % product.key, product, None, None, ("Нет соответствующей строки в автозагрузке",)))
+            active_matches = [row for row in matched if row.ad_id and row.ad_id in active]
+            # A client price can legitimately remain for a product whose old
+            # Autoload row is archived or whose listing is not published yet.
+            # The monitor's scope is active Avito ads, so it checks only rows
+            # currently confirmed as active by the profile API.
+            if not active_matches:
                 continue
-            for row in matched:
+            for row in active_matches:
                 avito = active.get(row.ad_id or "")
+                if row.ad_id:
+                    matched_active_ids.add(row.ad_id)
                 reasons: List[str] = []
                 if row.price != product.price:
                     reasons.append("цена не дошла из клиентской таблицы в автозагрузку")
@@ -689,9 +702,26 @@ class Monitor:
                 if reasons:
                     identifier = row.ad_id or (row.source_name + ":" + str(row.row))
                     issues.append(Issue("%s:%s" % (product.key, identifier), product, row, avito, tuple(reasons)))
-        autoload_ids = {row.ad_id for row in rows if row.ad_id}
+        active_autoload = {row.ad_id: row for row in rows if row.ad_id and row.ad_id in active}
         for item in active.values():
-            if item.item_id in autoload_ids:
+            row = active_autoload.get(item.item_id)
+            if row is not None:
+                if item.item_id in matched_active_ids:
+                    continue
+                autoload_product = Product(
+                    "autoload:%s" % item.item_id,
+                    "Автозагрузка",
+                    row.row,
+                    {"title": row.title or item.title},
+                    row.price if row.price is not None else item.price,
+                )
+                issues.append(Issue(
+                    "autoload:%s:missing-client-price" % item.item_id,
+                    autoload_product,
+                    row,
+                    item,
+                    ("Нет соответствующей цены в клиентской таблице",),
+                ))
                 continue
             avito_product = Product(
                 "avito:%s" % item.item_id,
