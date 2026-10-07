@@ -1,7 +1,9 @@
 import unittest
 
 from app.monitor import (
+    AvitoItem,
     AutoloadRow,
+    Monitor,
     Product,
     SheetSource,
     extract_autoload_rows,
@@ -61,6 +63,14 @@ class MatchingTests(unittest.TestCase):
         )
         self.assertEqual("iPhone 16E 128Gb black", product.title)
         self.assertTrue(product_matches(product, matching))
+
+    def test_reports_an_active_avito_listing_missing_from_autoload(self):
+        issues = Monitor(None)._find_issues(
+            [], [], {"123": AvitoItem("123", "iPhone 18 Pro", 290990, "active", "https://example.test/ad")}
+        )
+        self.assertEqual(1, len(issues))
+        self.assertEqual("Авито", issues[0].product.source_name)
+        self.assertIn("не найдено в автозагрузке", issues[0].reasons[0])
 
 
 if __name__ == "__main__":

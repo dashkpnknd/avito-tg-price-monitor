@@ -589,12 +589,18 @@ def notification_batches(messages: Iterable[str], heading: str, limit: int = 390
 def issue_example(issue: Issue) -> str:
     """A scan-friendly example card within a project digest."""
     title = issue.product.title or format_parameters(issue.product.parameters)
-    lines = [
-        "<b>%s</b>" % html.escape(title),
-        "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
-        "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
-        "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
-    ]
+    lines = ["<b>%s</b>" % html.escape(title)]
+    if issue.product.source_name == "Авито":
+        lines.extend((
+            "📥 Автозагрузка: <b>строка не найдена</b>",
+            "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
+        ))
+    else:
+        lines.extend((
+            "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
+            "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
+            "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
+        ))
     url = (issue.autoload.url if issue.autoload and issue.autoload.url else issue.avito.url if issue.avito else "")
     if url.startswith(("https://", "http://")):
         lines.append('🔗 <a href="%s">Открыть объявление</a>' % html.escape(url, quote=True))
@@ -683,6 +689,24 @@ class Monitor:
                 if reasons:
                     identifier = row.ad_id or (row.source_name + ":" + str(row.row))
                     issues.append(Issue("%s:%s" % (product.key, identifier), product, row, avito, tuple(reasons)))
+        autoload_ids = {row.ad_id for row in rows if row.ad_id}
+        for item in active.values():
+            if item.item_id in autoload_ids:
+                continue
+            avito_product = Product(
+                "avito:%s" % item.item_id,
+                "Авито",
+                0,
+                {"title": item.title},
+                item.price,
+            )
+            issues.append(Issue(
+                "avito:%s:missing-autoload" % item.item_id,
+                avito_product,
+                None,
+                item,
+                ("Активное объявление Авито не найдено в автозагрузке",),
+            ))
         return issues
 
     def _notify(self, issues: Sequence[Issue]) -> Tuple[int, int]:

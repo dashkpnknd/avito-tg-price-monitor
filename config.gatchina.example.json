@@ -2,12 +2,9 @@
   "project_name": "LimeStore Гатчина",
   "client_sources": [
     {
-      "name": "Гатчина Новые eSIM — Наличка",
+      "name": "Телефоны (авито)",
       "spreadsheet_id": "CLIENT_SPREADSHEET_ID",
-      "gid": "1521261025",
-      "kind": "phone_cash",
-      "title_column": "НОВЫЙ",
-      "price_column": "Lime Store Наличка"
+      "gid": "1044909971"
     },
     {
       "name": "Часы (авито)",
