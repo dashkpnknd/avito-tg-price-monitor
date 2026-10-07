@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import io
 import json
 import logging
@@ -558,7 +559,12 @@ def send_telegram(config: Config, text: str) -> None:
     if config.dry_run:
         logging.info("DRY RUN Telegram notification:\n%s", text)
         return
-    payload = urlencode({"chat_id": config.telegram_chat_id, "text": text, "disable_web_page_preview": "true"}).encode()
+    payload = urlencode({
+        "chat_id": config.telegram_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode()
     response = json.loads(http_text("https://api.telegram.org/bot%s/sendMessage" % config.telegram_token, method="POST", data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}))
     if not response.get("ok"):
         raise MonitorError("Telegram rejected notification")
@@ -580,15 +586,23 @@ def notification_batches(messages: Iterable[str], heading: str, limit: int = 390
     return batches
 
 
-def short_issue(issue: Issue) -> str:
-    """A readable sample line for a digest, not a verbose per-item alert."""
+def issue_example(issue: Issue) -> str:
+    """A scan-friendly example card within a project digest."""
     title = issue.product.title or format_parameters(issue.product.parameters)
-    return "%s — клиент %s, автозагрузка %s, Авито %s" % (
-        title,
-        format_price(issue.product.price),
-        format_price(issue.autoload.price if issue.autoload else None),
-        format_price(issue.avito.price if issue.avito else None),
-    )
+    return "\n".join((
+        "<b>%s</b>" % html.escape(title),
+        "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
+        "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
+        "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
+    ))
+
+
+def position_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "позиция"
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return "позиции"
+    return "позиций"
 
 
 def issue_digest(project_name: str, issues: Sequence[Issue], grace: timedelta, checked_at: datetime) -> str:
@@ -604,20 +618,27 @@ def issue_digest(project_name: str, issues: Sequence[Issue], grace: timedelta, c
         for issue in issues
     )
     lines = [
-        "⚠️ %s — требуется проверка цен" % project_name,
-        "Проверка: %s МСК" % checked_at.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m %H:%M"),
-        "Расхождения сохраняются более %s: %s поз." % (format_duration(grace), len(issues)),
+        "⚠️ <b>Проверь цены</b>",
+        "🏪 <b>%s</b>" % html.escape(project_name),
+        "🕐 <b>Проверка:</b> %s МСК" % checked_at.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m, %H:%M"),
+        "",
+        "<b>%s %s</b> не синхронизировались за %s." % (len(issues), position_word(len(issues)), format_duration(grace)),
     ]
+    stages: List[str] = []
     if client_to_autoload:
-        lines.append("• Клиентская таблица → автозагрузка: %s" % client_to_autoload)
+        stages.append("👤 Клиентская таблица → автозагрузка: <b>%s</b>" % client_to_autoload)
     if autoload_to_avito:
-        lines.append("• Автозагрузка → Авито: %s" % autoload_to_avito)
+        stages.append("📥 Автозагрузка → Авито: <b>%s</b>" % autoload_to_avito)
     if missing:
-        lines.append("• Не найдена строка или активное объявление: %s" % missing)
+        stages.append("🔗 Нет строки или активного объявления: <b>%s</b>" % missing)
+    if stages:
+        lines.extend(("", "📍 <b>Где не обновилось</b>", *stages))
     if issues:
-        lines.append("\nПримеры для проверки:")
-        lines.extend("• " + short_issue(issue) for issue in issues[:3])
-    lines.append("\nЭто одна сводка по проекту, а не сообщения по каждому товару. Новые уведомления по нему будут приходить не чаще раза в сутки.")
+        lines.extend(("", "🔎 <b>Примеры</b>", ""))
+        for index, issue in enumerate(issues[:3]):
+            if index:
+                lines.append("")
+            lines.append(issue_example(issue))
     return "\n".join(lines)
 
 
