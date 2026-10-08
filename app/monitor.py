@@ -11,6 +11,7 @@ import re
 import tempfile
 import time
 import unicodedata
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,8 +22,12 @@ from urllib.request import Request, urlopen
 
 
 GOOGLE_EXPORT = "https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?gid={gid}&tqx=out:csv"
+GOOGLE_XLSX_EXPORT = "https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
 AVITO_API = "https://api.avito.ru"
 UTC = timezone.utc
+XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
 class MonitorError(RuntimeError):
@@ -43,6 +48,7 @@ class SheetSource:
 class Config:
     project_name: str
     client_sources: Tuple[SheetSource, ...]
+    client_spreadsheet_ids: Tuple[str, ...]
     autoload_sources: Tuple[SheetSource, ...]
     telegram_token: str
     telegram_chat_id: str
@@ -92,7 +98,15 @@ class Config:
                     raise MonitorError("Invalid entry in config.%s" % name) from error
             return tuple(result)
 
-        client_sources = sources("client_sources")
+        client_spreadsheet_id = str(raw.get("client_spreadsheet_id") or "").strip()
+        # New projects only need the workbook itself.  The monitor discovers
+        # every tab marked '(авито)' at each check.  client_sources is kept as
+        # a backwards-compatible input for already configured projects.
+        client_sources = (
+            (SheetSource("Все листы (авито)", client_spreadsheet_id, ""),)
+            if client_spreadsheet_id
+            else sources("client_sources")
+        )
         # The client workbook also contains source and operational tabs.  Only
         # the prepared Avito-template tabs are a part of this monitor.
         invalid_client_sources = [source.name for source in client_sources if "(авито)" not in source.name.lower()]
@@ -101,10 +115,12 @@ class Config:
                 "Each client source must be an Avito template tab marked '(авито)': %s"
                 % ", ".join(invalid_client_sources)
             )
+        client_spreadsheet_ids = tuple(dict.fromkeys(source.spreadsheet_id for source in client_sources))
 
         return cls(
             project_name=str(raw.get("project_name") or "Авито"),
             client_sources=client_sources,
+            client_spreadsheet_ids=client_spreadsheet_ids,
             autoload_sources=sources("autoload_sources"),
             telegram_token=required("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=required("TELEGRAM_CHAT_ID"),
@@ -223,10 +239,95 @@ def http_text(url: str, method: str = "GET", data: Optional[bytes] = None, heade
         raise MonitorError("Network error for %s: %s" % (url, error.reason)) from error
 
 
+def http_bytes(url: str) -> bytes:
+    request = Request(url, headers={"User-Agent": "avito-price-monitor/1.0"})
+    try:
+        with urlopen(request, timeout=60) as response:
+            return response.read()
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")[:500]
+        raise MonitorError("HTTP %s for %s: %s" % (error.code, url, body)) from error
+    except URLError as error:
+        raise MonitorError("Network error for %s: %s" % (url, error.reason)) from error
+
+
 def fetch_sheet(source: SheetSource) -> List[List[str]]:
     url = GOOGLE_EXPORT.format(sheet_id=source.spreadsheet_id, gid=source.gid)
     text = http_text(url)
     return [list(row) for row in csv.reader(io.StringIO(text))]
+
+
+def xlsx_column_index(reference: str) -> int:
+    letters = "".join(character for character in reference if character.isalpha())
+    result = 0
+    for character in letters:
+        result = result * 26 + ord(character.upper()) - ord("A") + 1
+    return result - 1
+
+
+def xlsx_text(element: object) -> str:
+    if element is None:
+        return ""
+    return "".join(
+        getattr(node, "text", "") or ""
+        for node in element.iter()
+        if getattr(node, "tag", "").endswith("}t")
+    )
+
+
+def parse_xlsx_workbook(payload: bytes) -> List[Tuple[str, List[List[str]]]]:
+    """Read a Google Sheets XLSX export without an extra runtime dependency."""
+    import xml.etree.ElementTree as ET
+
+    namespaces = {"x": XLSX_MAIN_NS, "r": XLSX_REL_NS, "pr": XLSX_PACKAGE_REL_NS}
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(payload))
+        shared: List[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            shared_root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            shared = [xlsx_text(item) for item in shared_root.findall("x:si", namespaces)]
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    except (KeyError, zipfile.BadZipFile, ET.ParseError) as error:
+        raise MonitorError("Could not read Google Sheets workbook export") from error
+
+    targets = {
+        relation.attrib.get("Id", ""): relation.attrib.get("Target", "")
+        for relation in relationships.findall("pr:Relationship", namespaces)
+    }
+    result: List[Tuple[str, List[List[str]]]] = []
+    for sheet in workbook.findall("x:sheets/x:sheet", namespaces):
+        name = sheet.attrib.get("name", "")
+        relationship_id = sheet.attrib.get("{%s}id" % XLSX_REL_NS, "")
+        target = targets.get(relationship_id, "")
+        if not name or not target:
+            continue
+        try:
+            root = ET.fromstring(archive.read("xl/" + target.lstrip("/")))
+        except (KeyError, ET.ParseError) as error:
+            raise MonitorError("Could not read worksheet '%s'" % name) from error
+        values_by_row: Dict[int, Dict[int, str]] = {}
+        for row in root.findall("x:sheetData/x:row", namespaces):
+            row_number = int(row.attrib.get("r", "0") or 0)
+            if not row_number:
+                continue
+            values = values_by_row.setdefault(row_number - 1, {})
+            for node in row.findall("x:c", namespaces):
+                column = xlsx_column_index(node.attrib.get("r", ""))
+                kind = node.attrib.get("t", "")
+                raw = node.findtext("x:v", default="", namespaces=namespaces)
+                if kind == "s" and raw.isdigit() and int(raw) < len(shared):
+                    values[column] = shared[int(raw)]
+                elif kind == "inlineStr":
+                    values[column] = xlsx_text(node.find("x:is", namespaces))
+                else:
+                    values[column] = raw
+        output: List[List[str]] = []
+        for row_number in range(max(values_by_row, default=-1) + 1):
+            values = values_by_row.get(row_number, {})
+            output.append([values.get(index, "") for index in range(max(values, default=-1) + 1)])
+        result.append((name, output))
+    return result
 
 
 def normalized(value: object) -> str:
@@ -331,6 +432,17 @@ def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List
             if not any(parameters.values()):
                 continue
             products.append(Product(product_key(source.name, row_number, parameters), source.name, row_number, parameters, price))
+    return products
+
+
+def fetch_avito_template_products(spreadsheet_id: str) -> List[Product]:
+    """Return every client product from tabs explicitly marked '(авито)'."""
+    payload = http_bytes(GOOGLE_XLSX_EXPORT.format(sheet_id=spreadsheet_id))
+    products: List[Product] = []
+    for name, rows in parse_xlsx_workbook(payload):
+        if "(авито)" not in name.lower():
+            continue
+        products.extend(extract_products(SheetSource(name, spreadsheet_id, name), rows))
     return products
 
 
@@ -684,8 +796,8 @@ class Monitor:
 
     def run_once(self) -> RunSummary:
         client: List[Product] = []
-        for source in self.config.client_sources:
-            client.extend(extract_products(source, fetch_sheet(source)))
+        for spreadsheet_id in self.config.client_spreadsheet_ids:
+            client.extend(fetch_avito_template_products(spreadsheet_id))
         autoload: List[AutoloadRow] = []
         for source in self.config.autoload_sources:
             autoload.extend(extract_autoload_rows(source, fetch_sheet(source)))
