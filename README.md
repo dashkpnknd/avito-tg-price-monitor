@@ -27,7 +27,7 @@ cp config.gatchina.example.json config.json
 mkdir -p data
 ```
 
-В `config.json` укажите ID клиентской таблицы в `client_spreadsheet_id` и листы автозагрузки. В `.env` задайте Telegram и Avito ключи, а также `TELEGRAM_CHAT_ID`. Эти файлы игнорируются Git.
+В `config.json` укажите ID клиентской таблицы в `client_spreadsheet_id` и ID автозагрузки в `autoload_spreadsheet_id`. Сервис сам найдёт вкладки с «(авито)» в клиентской таблице и вкладки с `Avito` или «Авито» в автозагрузке. В `.env` задайте Telegram и Avito ключи, а также `TELEGRAM_CHAT_ID`. Эти файлы игнорируются Git.
 
 Для проверки без сообщений в Telegram:
 

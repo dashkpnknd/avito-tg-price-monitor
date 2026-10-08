@@ -50,6 +50,7 @@ class Config:
     client_sources: Tuple[SheetSource, ...]
     client_spreadsheet_ids: Tuple[str, ...]
     autoload_sources: Tuple[SheetSource, ...]
+    autoload_spreadsheet_ids: Tuple[str, ...]
     telegram_token: str
     telegram_chat_id: str
     avito_client_id: str
@@ -99,6 +100,7 @@ class Config:
             return tuple(result)
 
         client_spreadsheet_id = str(raw.get("client_spreadsheet_id") or "").strip()
+        autoload_spreadsheet_id = str(raw.get("autoload_spreadsheet_id") or "").strip()
         # New projects only need the workbook itself.  The monitor discovers
         # every tab marked '(авито)' at each check.  client_sources is kept as
         # a backwards-compatible input for already configured projects.
@@ -106,6 +108,11 @@ class Config:
             (SheetSource("Все листы (авито)", client_spreadsheet_id, ""),)
             if client_spreadsheet_id
             else sources("client_sources")
+        )
+        autoload_sources = (
+            (SheetSource("Все листы Avito", autoload_spreadsheet_id, ""),)
+            if autoload_spreadsheet_id
+            else sources("autoload_sources")
         )
         # The client workbook also contains source and operational tabs.  Only
         # the prepared Avito-template tabs are a part of this monitor.
@@ -116,12 +123,14 @@ class Config:
                 % ", ".join(invalid_client_sources)
             )
         client_spreadsheet_ids = tuple(dict.fromkeys(source.spreadsheet_id for source in client_sources))
+        autoload_spreadsheet_ids = tuple(dict.fromkeys(source.spreadsheet_id for source in autoload_sources))
 
         return cls(
             project_name=str(raw.get("project_name") or "Авито"),
             client_sources=client_sources,
             client_spreadsheet_ids=client_spreadsheet_ids,
-            autoload_sources=sources("autoload_sources"),
+            autoload_sources=autoload_sources,
+            autoload_spreadsheet_ids=autoload_spreadsheet_ids,
             telegram_token=required("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=required("TELEGRAM_CHAT_ID"),
             avito_client_id=required("AVITO_CLIENT_ID"),
@@ -306,6 +315,23 @@ def parse_xlsx_workbook(payload: bytes) -> List[Tuple[str, List[List[str]]]]:
             root = ET.fromstring(archive.read("xl/" + target.lstrip("/")))
         except (KeyError, ET.ParseError) as error:
             raise MonitorError("Could not read worksheet '%s'" % name) from error
+        target_path = target.lstrip("/")
+        directory, filename = target_path.rsplit("/", 1)
+        relation_path = "xl/%s/_rels/%s.rels" % (directory, filename)
+        hyperlink_targets: Dict[str, str] = {}
+        if relation_path in archive.namelist():
+            relation_root = ET.fromstring(archive.read(relation_path))
+            hyperlink_targets = {
+                relation.attrib.get("Id", ""): relation.attrib.get("Target", "")
+                for relation in relation_root.findall("pr:Relationship", namespaces)
+            }
+        hyperlinks = {
+            hyperlink.attrib.get("ref", ""): (
+                hyperlink.attrib.get("location", "")
+                or hyperlink_targets.get(hyperlink.attrib.get("{%s}id" % XLSX_REL_NS, ""), "")
+            )
+            for hyperlink in root.findall("x:hyperlinks/x:hyperlink", namespaces)
+        }
         values_by_row: Dict[int, Dict[int, str]] = {}
         for row in root.findall("x:sheetData/x:row", namespaces):
             row_number = int(row.attrib.get("r", "0") or 0)
@@ -322,6 +348,9 @@ def parse_xlsx_workbook(payload: bytes) -> List[Tuple[str, List[List[str]]]]:
                     values[column] = xlsx_text(node.find("x:is", namespaces))
                 else:
                     values[column] = raw
+                hyperlink = hyperlinks.get(node.attrib.get("r", ""), "")
+                if hyperlink.startswith(("https://", "http://")):
+                    values[column] = hyperlink
         output: List[List[str]] = []
         for row_number in range(max(values_by_row, default=-1) + 1):
             values = values_by_row.get(row_number, {})
@@ -446,6 +475,22 @@ def fetch_avito_template_products(spreadsheet_id: str) -> List[Product]:
     return products
 
 
+def is_avito_sheet_name(name: str) -> bool:
+    value = name.lower()
+    return "avito" in value or "авито" in value
+
+
+def fetch_avito_autoload_rows(spreadsheet_id: str) -> List[AutoloadRow]:
+    """Return every autoload row from tabs explicitly marked Avito/Авито."""
+    payload = http_bytes(GOOGLE_XLSX_EXPORT.format(sheet_id=spreadsheet_id))
+    rows: List[AutoloadRow] = []
+    for name, values in parse_xlsx_workbook(payload):
+        if not is_avito_sheet_name(name):
+            continue
+        rows.extend(extract_autoload_rows(SheetSource(name, spreadsheet_id, name), values))
+    return rows
+
+
 COLOR_ALIASES = {
     "black": "черный",
     "white": "белый",
@@ -528,6 +573,7 @@ def extract_phone_cash_products(source: SheetSource, rows: Sequence[Sequence[str
 
 
 def extract_ad_id(headers: Sequence[str], row: Sequence[str]) -> Tuple[Optional[str], str]:
+    fallback_id: Optional[str] = None
     for index, value in enumerate(headers):
         name = normalized(value)
         item = cell(row, index)
@@ -538,8 +584,8 @@ def extract_ad_id(headers: Sequence[str], row: Sequence[str]) -> Tuple[Optional[
             if match:
                 return match.group(1), item
         if name in {"номеробъявления", "объявлениеid", "avitoid"} and re.fullmatch(r"\d{5,}", item):
-            return item, ""
-    return None, ""
+            fallback_id = item
+    return fallback_id, ""
 
 
 def extract_autoload_rows(source: SheetSource, rows: Sequence[Sequence[str]]) -> List[AutoloadRow]:
@@ -558,6 +604,12 @@ def extract_autoload_rows(source: SheetSource, rows: Sequence[Sequence[str]]) ->
         if not any(parameters.values()):
             continue
         ad_id, url = extract_ad_id(headers, row)
+        # Avito exports have a technical header row (Price, avitoid, …) below
+        # a friendly Russian row containing "Ссылка на объявление".  Keep the
+        # technical row for matching, but use the friendly row to recover the
+        # clickable listing link from an XLSX export.
+        if not ad_id and header_row > 0:
+            ad_id, url = extract_ad_id(rows[header_row - 1], row)
         result.append(AutoloadRow(source.name, row_number, parameters, parse_price(cell(row, price_column)), ad_id, url))
     return result
 
@@ -799,8 +851,8 @@ class Monitor:
         for spreadsheet_id in self.config.client_spreadsheet_ids:
             client.extend(fetch_avito_template_products(spreadsheet_id))
         autoload: List[AutoloadRow] = []
-        for source in self.config.autoload_sources:
-            autoload.extend(extract_autoload_rows(source, fetch_sheet(source)))
+        for spreadsheet_id in self.config.autoload_spreadsheet_ids:
+            autoload.extend(fetch_avito_autoload_rows(spreadsheet_id))
         active = fetch_active_avito_items(self.config)
         issues = self._find_issues(client, autoload, active)
         alerts, resolved = self._notify(issues)
