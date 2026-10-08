@@ -1,5 +1,6 @@
 import unittest
 
+from app.admin_bot import spreadsheet_id
 from app.monitor import (
     AvitoItem,
     AutoloadRow,
@@ -15,6 +16,13 @@ from app.monitor import (
 
 
 class MatchingTests(unittest.TestCase):
+    def test_extracts_google_spreadsheet_id_for_admin_wizard(self):
+        self.assertEqual(
+            "1abc_DEF-123456789012345",
+            spreadsheet_id("https://docs.google.com/spreadsheets/d/1abc_DEF-123456789012345/edit#gid=0"),
+        )
+        self.assertIsNone(spreadsheet_id("https://example.test/not-a-sheet"))
+
     def test_extracts_title_price_products(self):
         rows = [["Title", "Price"], ["Apple Watch SE 3 (2025) 40mm Midnight", "24 990"]]
         products = extract_products(SheetSource("Часы", "id", "gid"), rows)
