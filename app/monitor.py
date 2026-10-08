@@ -92,9 +92,19 @@ class Config:
                     raise MonitorError("Invalid entry in config.%s" % name) from error
             return tuple(result)
 
+        client_sources = sources("client_sources")
+        # The client workbook also contains source and operational tabs.  Only
+        # the prepared Avito-template tabs are a part of this monitor.
+        invalid_client_sources = [source.name for source in client_sources if "(авито)" not in source.name.lower()]
+        if invalid_client_sources:
+            raise MonitorError(
+                "Each client source must be an Avito template tab marked '(авито)': %s"
+                % ", ".join(invalid_client_sources)
+            )
+
         return cls(
             project_name=str(raw.get("project_name") or "Авито"),
-            client_sources=sources("client_sources"),
+            client_sources=client_sources,
             autoload_sources=sources("autoload_sources"),
             telegram_token=required("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=required("TELEGRAM_CHAT_ID"),
@@ -459,6 +469,16 @@ def product_matches(product: Product, row: AutoloadRow) -> bool:
     return True
 
 
+def is_used_item(row: AutoloadRow) -> bool:
+    """Return False for manually published second-hand listings.
+
+    The autoload uses these condition values for second-hand devices.  A blank
+    condition is retained: some supported categories do not expose this field.
+    """
+    condition = row.parameters.get("condition", "") or row.parameters.get("состояние", "")
+    return normalized(condition) not in {"удовлетворительное", "хорошее", "отличное"}
+
+
 def get_avito_token(config: Config) -> str:
     data = urlencode({"grant_type": "client_credentials", "client_id": config.avito_client_id, "client_secret": config.avito_client_secret}).encode()
     payload = json.loads(http_text(AVITO_API + "/token", method="POST", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}))
@@ -677,8 +697,9 @@ class Monitor:
     def _find_issues(self, products: Sequence[Product], rows: Sequence[AutoloadRow], active: Dict[str, AvitoItem]) -> List[Issue]:
         issues: List[Issue] = []
         matched_active_ids = set()
+        monitored_rows = [row for row in rows if is_used_item(row)]
         for product in products:
-            matched = [row for row in rows if product_matches(product, row)]
+            matched = [row for row in monitored_rows if product_matches(product, row)]
             active_matches = [row for row in matched if row.ad_id and row.ad_id in active]
             # A client price can legitimately remain for a product whose old
             # Autoload row is archived or whose listing is not published yet.
@@ -702,7 +723,7 @@ class Monitor:
                 if reasons:
                     identifier = row.ad_id or (row.source_name + ":" + str(row.row))
                     issues.append(Issue("%s:%s" % (product.key, identifier), product, row, avito, tuple(reasons)))
-        active_autoload = {row.ad_id: row for row in rows if row.ad_id and row.ad_id in active}
+        active_autoload = {row.ad_id: row for row in monitored_rows if row.ad_id and row.ad_id in active}
         for item in active.values():
             row = active_autoload.get(item.item_id)
             if row is not None:
@@ -722,21 +743,6 @@ class Monitor:
                     item,
                     ("Нет соответствующей цены в клиентской таблице",),
                 ))
-                continue
-            avito_product = Product(
-                "avito:%s" % item.item_id,
-                "Авито",
-                0,
-                {"title": item.title},
-                item.price,
-            )
-            issues.append(Issue(
-                "avito:%s:missing-autoload" % item.item_id,
-                avito_product,
-                None,
-                item,
-                ("Активное объявление Авито не найдено в автозагрузке",),
-            ))
         return issues
 
     def _notify(self, issues: Sequence[Issue]) -> Tuple[int, int]:

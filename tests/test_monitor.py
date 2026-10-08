@@ -64,13 +64,17 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual("iPhone 16E 128Gb black", product.title)
         self.assertTrue(product_matches(product, matching))
 
-    def test_reports_an_active_avito_listing_missing_from_autoload(self):
+    def test_ignores_an_active_avito_listing_missing_from_autoload(self):
         issues = Monitor(None)._find_issues(
             [], [], {"123": AvitoItem("123", "iPhone 18 Pro", 290990, "active", "https://example.test/ad")}
         )
-        self.assertEqual(1, len(issues))
-        self.assertEqual("Авито", issues[0].product.source_name)
-        self.assertIn("не найдено в автозагрузке", issues[0].reasons[0])
+        self.assertEqual([], issues)
+
+    def test_ignores_second_hand_autoload_row(self):
+        product = Product("key", "Телефоны (авито)", 2, {"title": "Used phone"}, 100)
+        used = AutoloadRow("Автозагрузка", 5, {"title": "Used phone", "condition": "Хорошее"}, 90, "123", "")
+        active = {"123": AvitoItem("123", "Used phone", 90, "active", "https://example.test/ad")}
+        self.assertEqual([], Monitor(None)._find_issues([product], [used], active))
 
     def test_ignores_client_product_with_only_an_archived_autoload_row(self):
         product = Product("key", "Клиент", 2, {"title": "Archived phone"}, 100)
