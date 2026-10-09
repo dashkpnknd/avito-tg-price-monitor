@@ -37,12 +37,17 @@ class AdminBot:
 
     def _api(self, method: str, payload: Optional[Dict[str, str]] = None) -> Dict[str, object]:
         body = urlencode(payload or {}).encode() if payload else None
-        raw = http_text(
-            "https://api.telegram.org/bot%s/%s" % (self.config.telegram_token, method),
-            method="POST" if body else "GET",
-            data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"} if body else None,
-        )
+        try:
+            raw = http_text(
+                "https://api.telegram.org/bot%s/%s" % (self.config.telegram_token, method),
+                method="POST" if body else "GET",
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"} if body else None,
+            )
+        except MonitorError as error:
+            # http_text includes its URL in diagnostics; never let a bot token
+            # travel further into container logs.
+            raise MonitorError(str(error).replace(self.config.telegram_token, "<redacted>")) from error
         response = json.loads(raw)
         if not response.get("ok"):
             raise MonitorError("Telegram admin interface request was rejected")
@@ -199,7 +204,7 @@ class AdminBot:
             return
         state = load_state(self.state_path)
         offset = int(state.get("offset", 0) or 0)
-        response = self._api("getUpdates", {"offset": str(offset), "timeout": "0", "allowed_updates": json.dumps(["message", "callback_query"])})
+        response = self._api("getUpdates", {"offset": str(offset), "timeout": "20", "allowed_updates": json.dumps(["message", "callback_query"])})
         sessions = self._sessions()
         for update in response.get("result", []):
             if not isinstance(update, dict):
