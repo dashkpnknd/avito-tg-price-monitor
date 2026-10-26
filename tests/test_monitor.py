@@ -15,6 +15,7 @@ from app.monitor import (
     SheetSource,
     extract_autoload_rows,
     extract_products,
+    fetch_active_avito_items,
     issue_digests,
     parse_phone_title,
     product_matches,
@@ -157,6 +158,20 @@ class MatchingTests(unittest.TestCase):
         full_text = "\n".join(batches)
         for index in range(4):
             self.assertIn("Товар %s" % index, full_text)
+
+    def test_skips_a_partial_avito_resource_without_stopping_the_project(self):
+        with TemporaryDirectory() as directory:
+            config = self.notification_config(directory)
+            payload = {
+                "resources": [
+                    {"id": 1, "price": 100, "status": "active", "title": "Complete"},
+                    {"id": 2, "status": "active", "title": "No price"},
+                ],
+                "meta": {"per_page": 25},
+            }
+            with patch("app.monitor.get_avito_token", return_value="token"), patch("app.monitor.avito_json", return_value=payload):
+                items = fetch_active_avito_items(config)
+        self.assertEqual(["1"], list(items))
 
     def test_keeps_phone_title_for_a_readable_digest_without_matching_on_it(self):
         rows = [["НОВЫЙ", "Lime Store Наличка"], ["iPhone 16E 128Gb black", "57 990"]]

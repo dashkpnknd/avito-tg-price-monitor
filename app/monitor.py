@@ -714,6 +714,7 @@ def fetch_active_avito_items(config: Config) -> Dict[str, AvitoItem]:
     token = get_avito_token(config)
     headers = {"Authorization": "Bearer " + token}
     result: Dict[str, AvitoItem] = {}
+    incomplete_items = 0
     for page in range(1, config.max_avito_pages + 1):
         if page > 1:
             # Keep the regular hourly scan well under the listing endpoint's
@@ -724,13 +725,23 @@ def fetch_active_avito_items(config: Config) -> Dict[str, AvitoItem]:
         if not isinstance(resources, list):
             raise MonitorError("Unexpected Avito item list response")
         for item in resources:
+            if not isinstance(item, dict):
+                incomplete_items += 1
+                continue
             try:
                 parsed = AvitoItem(str(item["id"]), str(item.get("title", "")), int(item["price"]), str(item.get("status", "")), str(item.get("url", "")))
             except (KeyError, TypeError, ValueError) as error:
-                raise MonitorError("Unexpected Avito item format") from error
+                # Avito occasionally returns a partial resource without a
+                # price.  It cannot be compared reliably, so ignore only that
+                # resource instead of aborting monitoring for the whole city.
+                incomplete_items += 1
+                logging.warning("Skipping Avito resource without comparable price: %s", error)
+                continue
             if parsed.status == "active":
                 result[parsed.item_id] = parsed
         if len(resources) < int(payload.get("meta", {}).get("per_page", 25)):
+            if incomplete_items:
+                logging.warning("Skipped %s incomplete Avito resources", incomplete_items)
             return result
     raise MonitorError("Avito pagination exceeded MAX_AVITO_PAGES; no notifications sent")
 
