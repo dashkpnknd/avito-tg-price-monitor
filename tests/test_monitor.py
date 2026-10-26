@@ -1,9 +1,15 @@
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from app.admin_bot import spreadsheet_id
 from app.monitor import (
     AvitoItem,
     AutoloadRow,
+    Config,
+    Issue,
     Monitor,
     Product,
     SheetSource,
@@ -12,10 +18,76 @@ from app.monitor import (
     notification_batches,
     parse_phone_title,
     product_matches,
+    load_state,
 )
 
 
 class MatchingTests(unittest.TestCase):
+    def notification_config(self, directory: str) -> Config:
+        return Config(
+            project_name="Тестовый проект",
+            client_sources=(),
+            client_spreadsheet_ids=(),
+            autoload_sources=(),
+            autoload_spreadsheet_ids=(),
+            telegram_token="test-token",
+            telegram_chat_id="-1001",
+            avito_client_id="client",
+            avito_client_secret="secret",
+            state_path=Path(directory) / "state.json",
+            check_interval_minutes=60,
+            mismatch_grace=timedelta(hours=5),
+            notification_repeat=timedelta(hours=24),
+            max_avito_pages=1,
+            dry_run=False,
+        )
+
+    @staticmethod
+    def notification_issue() -> Issue:
+        product = Product("product", "Телефоны (авито)", 2, {"title": "iPhone"}, 100)
+        autoload = AutoloadRow("Avito", 2, {"title": "iPhone"}, 90, "123", "")
+        avito = AvitoItem("123", "iPhone", 90, "active", "")
+        return Issue("product:123", product, autoload, avito, ("цена не дошла из клиентской таблицы в автозагрузку",))
+
+    def test_reuses_one_telegram_card_for_an_ongoing_issue(self):
+        issue = self.notification_issue()
+        started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=started):
+                monitor._notify([issue])
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
+                "app.monitor.send_telegram", return_value=42
+            ) as sent:
+                monitor._notify([issue])
+                sent.assert_called_once()
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=29)), patch(
+                "app.monitor.send_telegram"
+            ) as sent, patch("app.monitor.edit_telegram") as edited:
+                monitor._notify([issue])
+                sent.assert_not_called()
+                edited.assert_called_once()
+                self.assertEqual(42, edited.call_args.args[1])
+            self.assertEqual("42", load_state(monitor.config.state_path)["__monitor__"]["report_message_id"])
+
+    def test_removes_the_card_when_the_issue_is_resolved(self):
+        issue = self.notification_issue()
+        started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=started):
+                monitor._notify([issue])
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
+                "app.monitor.send_telegram", return_value=42
+            ):
+                monitor._notify([issue])
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=6)), patch(
+                "app.monitor.delete_telegram"
+            ) as deleted:
+                monitor._notify([])
+                deleted.assert_called_once_with(monitor.config, 42)
+            self.assertNotIn("report_message_id", load_state(monitor.config.state_path)["__monitor__"])
+
     def test_extracts_google_spreadsheet_id_for_admin_wizard(self):
         self.assertEqual(
             "1abc_DEF-123456789012345",

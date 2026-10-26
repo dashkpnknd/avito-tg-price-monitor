@@ -475,6 +475,27 @@ def fetch_avito_template_products(spreadsheet_id: str) -> List[Product]:
     return products
 
 
+def named_tab_source(source: SheetSource) -> bool:
+    """A registry project can opt into an explicitly named legacy tab."""
+    return source.gid.startswith("tab:")
+
+
+def fetch_named_client_products(sources: Sequence[SheetSource]) -> List[Product]:
+    by_workbook: Dict[str, List[SheetSource]] = {}
+    for source in sources:
+        by_workbook.setdefault(source.spreadsheet_id, []).append(source)
+    products: List[Product] = []
+    for spreadsheet_id, workbook_sources in by_workbook.items():
+        tabs = {name.casefold(): values for name, values in parse_xlsx_workbook(http_bytes(GOOGLE_XLSX_EXPORT.format(sheet_id=spreadsheet_id)))}
+        for source in workbook_sources:
+            tab_name = source.gid[4:]
+            values = tabs.get(tab_name.casefold())
+            if values is None:
+                raise MonitorError("Configured client tab was not found: %s" % tab_name)
+            products.extend(extract_products(source, values))
+    return products
+
+
 def is_avito_sheet_name(name: str) -> bool:
     value = name.lower()
     return "avito" in value or "авито" in value
@@ -488,6 +509,22 @@ def fetch_avito_autoload_rows(spreadsheet_id: str) -> List[AutoloadRow]:
         if not is_avito_sheet_name(name):
             continue
         rows.extend(extract_autoload_rows(SheetSource(name, spreadsheet_id, name), values))
+    return rows
+
+
+def fetch_named_autoload_rows(sources: Sequence[SheetSource]) -> List[AutoloadRow]:
+    by_workbook: Dict[str, List[SheetSource]] = {}
+    for source in sources:
+        by_workbook.setdefault(source.spreadsheet_id, []).append(source)
+    rows: List[AutoloadRow] = []
+    for spreadsheet_id, workbook_sources in by_workbook.items():
+        tabs = {name.casefold(): values for name, values in parse_xlsx_workbook(http_bytes(GOOGLE_XLSX_EXPORT.format(sheet_id=spreadsheet_id)))}
+        for source in workbook_sources:
+            tab_name = source.gid[4:]
+            values = tabs.get(tab_name.casefold())
+            if values is None:
+                raise MonitorError("Configured autoload tab was not found: %s" % tab_name)
+            rows.extend(extract_autoload_rows(source, values))
     return rows
 
 
@@ -739,19 +776,62 @@ def format_parameters(values: Dict[str, str]) -> str:
     return ", ".join("%s: %s" % pair for pair in values.items() if pair[1])
 
 
-def send_telegram(config: Config, text: str) -> None:
+def telegram_request(config: Config, method: str, payload: Dict[str, str]) -> object:
+    """Call Telegram without allowing the bot token into diagnostic logs."""
+    try:
+        raw = http_text(
+            "https://api.telegram.org/bot%s/%s" % (config.telegram_token, method),
+            method="POST",
+            data=urlencode(payload).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except MonitorError as error:
+        raise MonitorError(str(error).replace(config.telegram_token, "<redacted>")) from error
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise MonitorError("Telegram returned an invalid response") from error
+    if not response.get("ok"):
+        raise MonitorError("Telegram rejected %s" % method)
+    return response.get("result")
+
+
+def send_telegram(config: Config, text: str) -> Optional[int]:
     if config.dry_run:
         logging.info("DRY RUN Telegram notification:\n%s", text)
-        return
-    payload = urlencode({
+        return None
+    result = telegram_request(config, "sendMessage", {
         "chat_id": config.telegram_chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
-    }).encode()
-    response = json.loads(http_text("https://api.telegram.org/bot%s/sendMessage" % config.telegram_token, method="POST", data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}))
-    if not response.get("ok"):
-        raise MonitorError("Telegram rejected notification")
+    })
+    if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
+        raise MonitorError("Telegram did not return a message ID")
+    return result["message_id"]
+
+
+def edit_telegram(config: Config, message_id: int, text: str) -> None:
+    if config.dry_run:
+        logging.info("DRY RUN Telegram message update %s:\n%s", message_id, text)
+        return
+    telegram_request(config, "editMessageText", {
+        "chat_id": config.telegram_chat_id,
+        "message_id": str(message_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    })
+
+
+def delete_telegram(config: Config, message_id: int) -> None:
+    if config.dry_run:
+        logging.info("DRY RUN Telegram message deletion %s", message_id)
+        return
+    telegram_request(config, "deleteMessage", {
+        "chat_id": config.telegram_chat_id,
+        "message_id": str(message_id),
+    })
 
 
 def notification_batches(messages: Iterable[str], heading: str, limit: int = 3900) -> List[str]:
@@ -842,17 +922,50 @@ def issue_digest(project_name: str, issues: Sequence[Issue], grace: timedelta, c
     return "\n".join(lines)
 
 
+def resolved_digest(project_name: str, checked_at: datetime) -> str:
+    return "\n".join((
+        "✅ <b>Цены синхронизированы</b>",
+        "🏪 <b>%s</b>" % html.escape(project_name),
+        "🕐 <b>Проверка:</b> %s МСК" % checked_at.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m, %H:%M"),
+        "",
+        "Актуальных расхождений нет.",
+    ))
+
+
+def issue_signature(issues: Sequence[Issue]) -> str:
+    """A stable report identity which intentionally excludes the check time."""
+    items = []
+    for issue in issues:
+        items.append((
+            issue.key,
+            issue.product.price,
+            issue.autoload.price if issue.autoload else None,
+            issue.avito.price if issue.avito else None,
+            issue.reasons,
+        ))
+    encoded = json.dumps(sorted(items), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class Monitor:
     def __init__(self, config: Config):
         self.config = config
 
     def run_once(self) -> RunSummary:
-        client: List[Product] = []
-        for spreadsheet_id in self.config.client_spreadsheet_ids:
-            client.extend(fetch_avito_template_products(spreadsheet_id))
-        autoload: List[AutoloadRow] = []
-        for spreadsheet_id in self.config.autoload_spreadsheet_ids:
-            autoload.extend(fetch_avito_autoload_rows(spreadsheet_id))
+        named_client_sources = [source for source in self.config.client_sources if named_tab_source(source)]
+        if named_client_sources:
+            client = fetch_named_client_products(named_client_sources)
+        else:
+            client = []
+            for spreadsheet_id in self.config.client_spreadsheet_ids:
+                client.extend(fetch_avito_template_products(spreadsheet_id))
+        named_autoload_sources = [source for source in self.config.autoload_sources if named_tab_source(source)]
+        if named_autoload_sources:
+            autoload = fetch_named_autoload_rows(named_autoload_sources)
+        else:
+            autoload = []
+            for spreadsheet_id in self.config.autoload_spreadsheet_ids:
+                autoload.extend(fetch_avito_autoload_rows(spreadsheet_id))
         active = fetch_active_avito_items(self.config)
         issues = self._find_issues(client, autoload, active)
         alerts, resolved = self._notify(issues)
@@ -924,23 +1037,75 @@ class Monitor:
                 entry = {"first_seen": current.isoformat(), "notified": "false"}
                 state[issue.key] = entry
             elapsed = current - parse_timestamp(entry["first_seen"])
-            if entry.get("notified") != "true" and elapsed >= self.config.mismatch_grace:
+            if elapsed >= self.config.mismatch_grace:
                 due.append((issue, entry, elapsed))
+
+        # One project always owns at most one active Telegram card.  A later
+        # check edits that card rather than creating another chat message.
+        # `last_digest_at` existed before message IDs were stored; retaining it
+        # prevents a deploy from immediately duplicating a legacy notification.
+        previous_message = str(meta.get("report_message_id", "")).strip()
+        try:
+            previous_message_id = int(previous_message) if previous_message else None
+        except ValueError:
+            previous_message_id = None
+        previous_signature = str(meta.get("report_signature", ""))
         last_digest_value = str(meta.get("last_digest_at", ""))
         last_digest = parse_timestamp(last_digest_value) if last_digest_value else None
-        can_send_digest = last_digest is None or current - last_digest >= self.config.notification_repeat
+
         alerts_sent = 0
-        if due and can_send_digest:
-            # A single digest represents the whole project.  Persist successful
-            # delivery immediately: the previous implementation waited until
-            # every long Telegram batch succeeded, so one 429 made it resend
-            # already delivered batches on every later scan.
-            send_telegram(self.config, issue_digest(self.config.project_name, issues, self.config.mismatch_grace, current))
+        if due:
+            signature = issue_signature([issue for issue, _, _ in due])
+            needs_refresh = (
+                previous_signature != signature
+                or last_digest is None
+                or current - last_digest >= self.config.notification_repeat
+            )
+            # A message created by a version before this change has no stored
+            # ID, so leave it alone until its normal repeat window expires.
+            if previous_message_id is None and last_digest is not None and current - last_digest < self.config.notification_repeat:
+                needs_refresh = False
+            if needs_refresh:
+                text = issue_digest(
+                    self.config.project_name,
+                    [issue for issue, _, _ in due],
+                    self.config.mismatch_grace,
+                    current,
+                )
+                if previous_message_id is not None:
+                    try:
+                        edit_telegram(self.config, previous_message_id, text)
+                    except MonitorError as error:
+                        # If Telegram no longer lets us edit that particular
+                        # card, replace it.  Deletion is best-effort because of
+                        # Telegram's age limit; a new card must still be shown.
+                        logging.warning(
+                            "Could not update Telegram card for %s: %s",
+                            self.config.project_name,
+                            error,
+                        )
+                        replacement_id = send_telegram(self.config, text)
+                        if replacement_id is not None:
+                            try:
+                                delete_telegram(self.config, previous_message_id)
+                            except MonitorError as delete_error:
+                                logging.warning(
+                                    "Could not remove replaced Telegram card for %s: %s",
+                                    self.config.project_name,
+                                    delete_error,
+                                )
+                            previous_message_id = replacement_id
+                            alerts_sent = 1
+                else:
+                    previous_message_id = send_telegram(self.config, text)
+                    alerts_sent = 1
+                if previous_message_id is not None:
+                    meta["report_message_id"] = str(previous_message_id)
+                meta["report_signature"] = signature
+                meta["last_digest_at"] = current.isoformat()
             for _, entry, _ in due:
                 entry["notified"] = "true"
-            meta["last_digest_at"] = current.isoformat()
-            save_state(self.config.state_path, state)
-            alerts_sent = 1
+
         resolved_keys: List[str] = []
         for key in list(state):
             if key == "__monitor__":
@@ -951,5 +1116,34 @@ class Monitor:
             if entry.get("notified") == "true":
                 resolved_keys.append(key)
             del state[key]
+
+        # Once every mature issue has disappeared, remove the old alert.  For
+        # cards that Telegram refuses to delete after its deletion window, edit
+        # the card into a short successful status so no stale warning remains.
+        if not due and previous_message_id is not None:
+            try:
+                delete_telegram(self.config, previous_message_id)
+            except MonitorError as error:
+                logging.info(
+                    "Could not delete resolved Telegram card for %s; marking it resolved instead: %s",
+                    self.config.project_name,
+                    error,
+                )
+                try:
+                    edit_telegram(self.config, previous_message_id, resolved_digest(self.config.project_name, current))
+                except MonitorError as edit_error:
+                    logging.warning(
+                        "Could not mark resolved Telegram card for %s: %s",
+                        self.config.project_name,
+                        edit_error,
+                    )
+                else:
+                    meta.pop("report_message_id", None)
+                    meta.pop("report_signature", None)
+                    meta.pop("last_digest_at", None)
+            else:
+                meta.pop("report_message_id", None)
+                meta.pop("report_signature", None)
+                meta.pop("last_digest_at", None)
         save_state(self.config.state_path, state)
         return alerts_sent, len(resolved_keys)

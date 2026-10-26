@@ -51,12 +51,28 @@ def config_for_project(base: Config, project: Dict[str, object]) -> Config:
     if not all((name, client_sheet, autoload_sheet, client_id, client_secret)) or delay_hours <= 0:
         raise MonitorError("Project registry contains an incomplete project")
     identifier = str(project.get("id") or project_id(name, client_sheet))
+    client_tab_names = project.get("client_tab_names")
+    autoload_tab_names = project.get("autoload_tab_names")
+    if client_tab_names is not None and (not isinstance(client_tab_names, list) or not all(isinstance(tab, str) and tab.strip() for tab in client_tab_names)):
+        raise MonitorError("Project registry contains invalid client tab names")
+    if autoload_tab_names is not None and (not isinstance(autoload_tab_names, list) or not all(isinstance(tab, str) and tab.strip() for tab in autoload_tab_names)):
+        raise MonitorError("Project registry contains invalid autoload tab names")
+    client_sources = (
+        tuple(SheetSource(tab.strip(), client_sheet, "tab:" + tab.strip()) for tab in client_tab_names)
+        if client_tab_names
+        else (SheetSource("Все листы (авито)", client_sheet, ""),)
+    )
+    autoload_sources = (
+        tuple(SheetSource(tab.strip(), autoload_sheet, "tab:" + tab.strip()) for tab in autoload_tab_names)
+        if autoload_tab_names
+        else (SheetSource("Все листы Avito", autoload_sheet, ""),)
+    )
     return replace(
         base,
         project_name=name,
-        client_sources=(SheetSource("Все листы (авито)", client_sheet, ""),),
+        client_sources=client_sources,
         client_spreadsheet_ids=(client_sheet,),
-        autoload_sources=(SheetSource("Все листы Avito", autoload_sheet, ""),),
+        autoload_sources=autoload_sources,
         autoload_spreadsheet_ids=(autoload_sheet,),
         avito_client_id=client_id,
         avito_client_secret=client_secret,
