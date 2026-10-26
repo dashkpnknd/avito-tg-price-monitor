@@ -15,7 +15,7 @@ from app.monitor import (
     SheetSource,
     extract_autoload_rows,
     extract_products,
-    notification_batches,
+    issue_digests,
     parse_phone_title,
     product_matches,
     load_state,
@@ -68,7 +68,7 @@ class MatchingTests(unittest.TestCase):
                 sent.assert_not_called()
                 edited.assert_called_once()
                 self.assertEqual(42, edited.call_args.args[1])
-            self.assertEqual("42", load_state(monitor.config.state_path)["__monitor__"]["report_message_id"])
+            self.assertEqual(["42"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
 
     def test_removes_the_card_when_the_issue_is_resolved(self):
         issue = self.notification_issue()
@@ -86,7 +86,7 @@ class MatchingTests(unittest.TestCase):
             ) as deleted:
                 monitor._notify([])
                 deleted.assert_called_once_with(monitor.config, 42)
-            self.assertNotIn("report_message_id", load_state(monitor.config.state_path)["__monitor__"])
+            self.assertNotIn("report_message_ids", load_state(monitor.config.state_path)["__monitor__"])
 
     def test_manual_report_stays_live_before_the_normal_grace_period(self):
         issue = self.notification_issue()
@@ -143,10 +143,20 @@ class MatchingTests(unittest.TestCase):
             parse_phone_title("14 plus 128 blue"),
         )
 
-    def test_splits_long_telegram_notification(self):
-        batches = notification_batches(["x" * 2000, "y" * 2000, "z" * 2000], "Заголовок", limit=3900)
-        self.assertEqual(3, len(batches))
+    def test_splits_a_full_report_without_dropping_items(self):
+        issues = []
+        for index in range(4):
+            title = "Товар %s %s" % (index, "x" * 1100)
+            product = Product("product-%s" % index, "Телефоны (авито)", index + 2, {"title": title}, 100)
+            autoload = AutoloadRow("Avito", index + 2, {"title": title}, 90, str(index), "")
+            avito = AvitoItem(str(index), title, 90, "active", "")
+            issues.append(Issue("issue-%s" % index, product, autoload, avito, ("цена не дошла из клиентской таблицы в автозагрузку",)))
+        batches = issue_digests("Тест", issues, timedelta(hours=5), datetime(2026, 10, 1, tzinfo=timezone.utc))
+        self.assertGreater(len(batches), 1)
         self.assertTrue(all(len(batch) <= 3900 for batch in batches))
+        full_text = "\n".join(batches)
+        for index in range(4):
+            self.assertIn("Товар %s" % index, full_text)
 
     def test_keeps_phone_title_for_a_readable_digest_without_matching_on_it(self):
         rows = [["НОВЫЙ", "Lime Store Наличка"], ["iPhone 16E 128Gb black", "57 990"]]

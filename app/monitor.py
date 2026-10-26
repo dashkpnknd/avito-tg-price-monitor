@@ -834,22 +834,6 @@ def delete_telegram(config: Config, message_id: int) -> None:
     })
 
 
-def notification_batches(messages: Iterable[str], heading: str, limit: int = 3900) -> List[str]:
-    """Keep multi-item alerts below Telegram's 4096-character limit."""
-    batches: List[str] = []
-    current = heading
-    for message in messages:
-        item = "\n\n──────────\n" + message
-        if len(current) + len(item) > limit and current != heading:
-            batches.append(current)
-            current = heading + item
-        else:
-            current += item
-    if current != heading:
-        batches.append(current)
-    return batches
-
-
 def issue_example(issue: Issue) -> str:
     """A scan-friendly example card within a project digest."""
     title = issue.product.title or format_parameters(issue.product.parameters)
@@ -885,18 +869,25 @@ def position_word(count: int) -> str:
     return "позиций"
 
 
-def issue_digest(project_name: str, issues: Sequence[Issue], grace: timedelta, checked_at: datetime) -> str:
-    """One compact project-level notification instead of a message per product."""
+def issue_digests(
+    project_name: str,
+    issues: Sequence[Issue],
+    grace: timedelta,
+    checked_at: datetime,
+    limit: int = 3900,
+) -> List[str]:
+    """Return the complete project report, split only at Telegram's hard limit."""
     client_to_autoload = sum(
         "цена не дошла из клиентской таблицы в автозагрузку" in issue.reasons for issue in issues
     )
     autoload_to_avito = sum(
         "цена не дошла из автозагрузки в Авито" in issue.reasons for issue in issues
     )
-    missing = sum(
-        any("не найдено" in reason or "нет ID" in reason or "не активно" in reason for reason in issue.reasons)
-        for issue in issues
-    )
+    missing = sum(any(
+        marker in reason.casefold()
+        for reason in issue.reasons
+        for marker in ("не найдено", "нет id", "не активно", "нет соответствующей")
+    ) for issue in issues)
     lines = [
         "⚠️ <b>Проверь цены</b>",
         "🏪 <b>%s</b>" % html.escape(project_name),
@@ -913,13 +904,25 @@ def issue_digest(project_name: str, issues: Sequence[Issue], grace: timedelta, c
         stages.append("🔗 Нет строки или активного объявления: <b>%s</b>" % missing)
     if stages:
         lines.extend(("", "📍 <b>Где не обновилось</b>", *stages))
-    if issues:
-        lines.extend(("", "🔎 <b>Примеры</b>", ""))
-        for index, issue in enumerate(issues[:3]):
-            if index:
-                lines.append("")
-            lines.append(issue_example(issue))
-    return "\n".join(lines)
+    lines.extend(("", "📋 <b>Что проверить</b>"))
+    heading = "\n".join(lines)
+    continuation = "\n".join((
+        "⚠️ <b>Проверь цены</b>",
+        "🏪 <b>%s</b>" % html.escape(project_name),
+        "",
+        "📋 <b>Что проверить, продолжение</b>",
+    ))
+    batches: List[str] = []
+    current = heading
+    for issue in issues:
+        item = issue_example(issue)
+        if len(current) + len(item) + 2 > limit and current != heading:
+            batches.append(current)
+            current = continuation + "\n\n" + item
+        else:
+            current += "\n\n" + item
+    batches.append(current)
+    return batches
 
 
 def resolved_digest(project_name: str, checked_at: datetime) -> str:
@@ -945,6 +948,64 @@ def issue_signature(issues: Sequence[Issue]) -> str:
         ))
     encoded = json.dumps(sorted(items), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def report_message_ids(meta: Dict[str, str]) -> List[int]:
+    """Read both the current list format and the former single-card format."""
+    raw_ids = meta.get("report_message_ids")
+    values = raw_ids if isinstance(raw_ids, list) else [meta.get("report_message_id", "")]
+    result: List[int] = []
+    for value in values:
+        try:
+            message_id = int(str(value))
+        except (TypeError, ValueError):
+            continue
+        if message_id > 0:
+            result.append(message_id)
+    return result
+
+
+def update_telegram_report(
+    config: Config,
+    previous_ids: Sequence[int],
+    messages: Sequence[str],
+) -> Tuple[List[int], int]:
+    """Edit a full report in place, adding or removing chunks only when needed."""
+    active_ids: List[int] = []
+    new_messages = 0
+    for index, text in enumerate(messages):
+        previous_id = previous_ids[index] if index < len(previous_ids) else None
+        if previous_id is None:
+            message_id = send_telegram(config, text)
+            if message_id is not None:
+                active_ids.append(message_id)
+                new_messages += 1
+            continue
+        try:
+            edit_telegram(config, previous_id, text)
+            active_ids.append(previous_id)
+        except MonitorError as error:
+            logging.warning("Could not update Telegram report card %s: %s", previous_id, error)
+            message_id = send_telegram(config, text)
+            if message_id is not None:
+                active_ids.append(message_id)
+                new_messages += 1
+                try:
+                    delete_telegram(config, previous_id)
+                except MonitorError as delete_error:
+                    logging.warning("Could not remove replaced Telegram report card %s: %s", previous_id, delete_error)
+    for previous_id in previous_ids[len(messages) :]:
+        try:
+            delete_telegram(config, previous_id)
+        except MonitorError as error:
+            # Deletion may be unavailable for an old message.  It is still
+            # better to make its state explicit than leave a partial report.
+            logging.info("Could not delete obsolete Telegram report card %s: %s", previous_id, error)
+            try:
+                edit_telegram(config, previous_id, "✅ <b>Отчёт обновлён</b>\nАктуальное продолжение находится выше.")
+            except MonitorError as edit_error:
+                logging.warning("Could not mark obsolete Telegram report card %s: %s", previous_id, edit_error)
+    return active_ids, new_messages
 
 
 class Monitor:
@@ -1044,15 +1105,10 @@ class Monitor:
             if force_notify or entry.get("notified") == "true" or elapsed >= self.config.mismatch_grace:
                 due.append((issue, entry, elapsed))
 
-        # One project always owns at most one active Telegram card.  A later
-        # check edits that card rather than creating another chat message.
-        # `last_digest_at` existed before message IDs were stored; retaining it
-        # prevents a deploy from immediately duplicating a legacy notification.
-        previous_message = str(meta.get("report_message_id", "")).strip()
-        try:
-            previous_message_id = int(previous_message) if previous_message else None
-        except ValueError:
-            previous_message_id = None
+        # One project owns one complete, current report.  It may need several
+        # Telegram messages solely because Telegram limits each one to 4,096
+        # characters.  The IDs let us update that whole set in place.
+        previous_message_ids = report_message_ids(meta)
         previous_signature = str(meta.get("report_signature", ""))
         last_digest_value = str(meta.get("last_digest_at", ""))
         last_digest = parse_timestamp(last_digest_value) if last_digest_value else None
@@ -1069,46 +1125,22 @@ class Monitor:
             )
             # A message created by a version before this change has no stored
             # ID, so leave it alone until its normal repeat window expires.
-            if previous_message_id is None and last_digest is not None and current - last_digest < self.config.notification_repeat:
+            if not previous_message_ids and last_digest is not None and current - last_digest < self.config.notification_repeat and not force_notify:
                 needs_refresh = False
             if needs_refresh:
-                text = issue_digest(
+                messages = issue_digests(
                     self.config.project_name,
                     [issue for issue, _, _ in due],
                     self.config.mismatch_grace,
                     current,
                 )
-                if previous_message_id is not None:
-                    try:
-                        edit_telegram(self.config, previous_message_id, text)
-                    except MonitorError as error:
-                        # If Telegram no longer lets us edit that particular
-                        # card, replace it.  Deletion is best-effort because of
-                        # Telegram's age limit; a new card must still be shown.
-                        logging.warning(
-                            "Could not update Telegram card for %s: %s",
-                            self.config.project_name,
-                            error,
-                        )
-                        replacement_id = send_telegram(self.config, text)
-                        if replacement_id is not None:
-                            try:
-                                delete_telegram(self.config, previous_message_id)
-                            except MonitorError as delete_error:
-                                logging.warning(
-                                    "Could not remove replaced Telegram card for %s: %s",
-                                    self.config.project_name,
-                                    delete_error,
-                                )
-                            previous_message_id = replacement_id
-                            alerts_sent = 1
-                else:
-                    previous_message_id = send_telegram(self.config, text)
-                    alerts_sent = 1
-                if previous_message_id is not None:
-                    meta["report_message_id"] = str(previous_message_id)
+                active_ids, new_messages = update_telegram_report(self.config, previous_message_ids, messages)
+                if active_ids:
+                    meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
+                    meta.pop("report_message_id", None)
                 meta["report_signature"] = signature
                 meta["last_digest_at"] = current.isoformat()
+                alerts_sent += new_messages
             for _, entry, _ in due:
                 entry["notified"] = "true"
 
@@ -1126,28 +1158,30 @@ class Monitor:
         # Once every mature issue has disappeared, remove the old alert.  For
         # cards that Telegram refuses to delete after its deletion window, edit
         # the card into a short successful status so no stale warning remains.
-        if not due and previous_message_id is not None:
-            try:
-                delete_telegram(self.config, previous_message_id)
-            except MonitorError as error:
-                logging.info(
-                    "Could not delete resolved Telegram card for %s; marking it resolved instead: %s",
-                    self.config.project_name,
-                    error,
-                )
+        if not due and previous_message_ids:
+            undeleted_ids: List[int] = []
+            for previous_message_id in previous_message_ids:
                 try:
-                    edit_telegram(self.config, previous_message_id, resolved_digest(self.config.project_name, current))
-                except MonitorError as edit_error:
-                    logging.warning(
-                        "Could not mark resolved Telegram card for %s: %s",
+                    delete_telegram(self.config, previous_message_id)
+                except MonitorError as error:
+                    logging.info(
+                        "Could not delete resolved Telegram card for %s; marking it resolved instead: %s",
                         self.config.project_name,
-                        edit_error,
+                        error,
                     )
-                else:
-                    meta.pop("report_message_id", None)
-                    meta.pop("report_signature", None)
-                    meta.pop("last_digest_at", None)
+                    try:
+                        edit_telegram(self.config, previous_message_id, resolved_digest(self.config.project_name, current))
+                    except MonitorError as edit_error:
+                        logging.warning(
+                            "Could not mark resolved Telegram card for %s: %s",
+                            self.config.project_name,
+                            edit_error,
+                        )
+                        undeleted_ids.append(previous_message_id)
+            if undeleted_ids:
+                meta["report_message_ids"] = [str(message_id) for message_id in undeleted_ids]
             else:
+                meta.pop("report_message_ids", None)
                 meta.pop("report_message_id", None)
                 meta.pop("report_signature", None)
                 meta.pop("last_digest_at", None)
