@@ -11,6 +11,7 @@ from app.monitor import (
     Config,
     Issue,
     Monitor,
+    MonitorError,
     Product,
     SheetSource,
     extract_autoload_rows,
@@ -50,7 +51,7 @@ class MatchingTests(unittest.TestCase):
         avito = AvitoItem("123", "iPhone", 90, "active", "")
         return Issue("product:123", product, autoload, avito, ("цена не дошла из клиентской таблицы в автозагрузку",))
 
-    def test_reuses_one_telegram_card_for_an_ongoing_issue(self):
+    def test_replaces_an_ongoing_report_with_a_new_message(self):
         issue = self.notification_issue()
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
@@ -63,13 +64,26 @@ class MatchingTests(unittest.TestCase):
                 monitor._notify([issue])
                 sent.assert_called_once()
             with patch("app.monitor.now_utc", return_value=started + timedelta(hours=29)), patch(
-                "app.monitor.send_telegram"
-            ) as sent, patch("app.monitor.edit_telegram") as edited:
+                "app.monitor.send_telegram", return_value=43
+            ) as sent, patch("app.monitor.delete_telegram") as deleted:
                 monitor._notify([issue])
-                sent.assert_not_called()
-                edited.assert_called_once()
-                self.assertEqual(42, edited.call_args.args[1])
-            self.assertEqual(["42"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
+                sent.assert_called_once()
+                deleted.assert_called_once_with(monitor.config, 42)
+            self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
+
+    def test_leaves_an_old_report_when_telegram_refuses_deletion(self):
+        issue = self.notification_issue()
+        started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=started), patch("app.monitor.send_telegram", return_value=42):
+                monitor._notify([issue], force_notify=True)
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=1)), patch(
+                "app.monitor.send_telegram", return_value=43
+            ), patch("app.monitor.delete_telegram", side_effect=MonitorError("too old")) as deleted:
+                monitor._notify([issue], force_notify=True)
+                deleted.assert_called_once_with(monitor.config, 42)
+            self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
 
     def test_removes_the_card_when_the_issue_is_resolved(self):
         issue = self.notification_issue()
