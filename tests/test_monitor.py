@@ -88,6 +88,21 @@ class MatchingTests(unittest.TestCase):
                 deleted.assert_called_once_with(monitor.config, 42)
             self.assertNotIn("report_message_id", load_state(monitor.config.state_path)["__monitor__"])
 
+    def test_manual_report_stays_live_before_the_normal_grace_period(self):
+        issue = self.notification_issue()
+        started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=started), patch(
+                "app.monitor.send_telegram", return_value=42
+            ):
+                monitor._notify([issue], force_notify=True)
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=1)), patch(
+                "app.monitor.delete_telegram"
+            ) as deleted:
+                monitor._notify([issue])
+                deleted.assert_not_called()
+
     def test_extracts_google_spreadsheet_id_for_admin_wizard(self):
         self.assertEqual(
             "1abc_DEF-123456789012345",

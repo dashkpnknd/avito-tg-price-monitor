@@ -951,7 +951,7 @@ class Monitor:
     def __init__(self, config: Config):
         self.config = config
 
-    def run_once(self) -> RunSummary:
+    def run_once(self, force_notify: bool = False) -> RunSummary:
         named_client_sources = [source for source in self.config.client_sources if named_tab_source(source)]
         if named_client_sources:
             client = fetch_named_client_products(named_client_sources)
@@ -968,7 +968,7 @@ class Monitor:
                 autoload.extend(fetch_avito_autoload_rows(spreadsheet_id))
         active = fetch_active_avito_items(self.config)
         issues = self._find_issues(client, autoload, active)
-        alerts, resolved = self._notify(issues)
+        alerts, resolved = self._notify(issues, force_notify=force_notify)
         return RunSummary(len(client), len(autoload), len(active), len(issues), alerts, resolved)
 
     def _find_issues(self, products: Sequence[Product], rows: Sequence[AutoloadRow], active: Dict[str, AvitoItem]) -> List[Issue]:
@@ -1022,7 +1022,7 @@ class Monitor:
                 ))
         return issues
 
-    def _notify(self, issues: Sequence[Issue]) -> Tuple[int, int]:
+    def _notify(self, issues: Sequence[Issue], force_notify: bool = False) -> Tuple[int, int]:
         state = load_state(self.config.state_path)
         current = now_utc()
         meta = state.setdefault("__monitor__", {})
@@ -1037,7 +1037,11 @@ class Monitor:
                 entry = {"first_seen": current.isoformat(), "notified": "false"}
                 state[issue.key] = entry
             elapsed = current - parse_timestamp(entry["first_seen"])
-            if elapsed >= self.config.mismatch_grace:
+            # Once a card has been deliberately sent (for example, for a
+            # requested manual check), keep it live during the usual grace
+            # period too.  Otherwise the very next routine check would remove
+            # a card that was just sent early.
+            if force_notify or entry.get("notified") == "true" or elapsed >= self.config.mismatch_grace:
                 due.append((issue, entry, elapsed))
 
         # One project always owns at most one active Telegram card.  A later
@@ -1057,6 +1061,8 @@ class Monitor:
         if due:
             signature = issue_signature([issue for issue, _, _ in due])
             needs_refresh = (
+                force_notify
+                or
                 previous_signature != signature
                 or last_digest is None
                 or current - last_digest >= self.config.notification_repeat
