@@ -17,6 +17,7 @@ from app.monitor import (
     extract_autoload_rows,
     extract_products,
     fetch_active_avito_items,
+    issue_example,
     issue_digests,
     parse_phone_title,
     product_matches,
@@ -186,6 +187,22 @@ class MatchingTests(unittest.TestCase):
             with patch("app.monitor.get_avito_token", return_value="token"), patch("app.monitor.avito_json", return_value=payload):
                 items = fetch_active_avito_items(config)
         self.assertEqual(["1"], list(items))
+
+    def test_explains_that_an_unmatched_client_row_is_not_a_missing_price(self):
+        autoload = AutoloadRow(
+            "Avito", 2,
+            {"title": "iPhone 17 Pro Max, 1 ТБ", "color": "серебристый", "simconfig": "Только eSIM"},
+            134499, "123", "",
+        )
+        issue = Issue(
+            "missing-client", Product("autoload:123", "Автозагрузка", 2, {"title": "iPhone 17 Pro Max, 1 ТБ"}, 134499),
+            autoload, AvitoItem("123", "iPhone 17 Pro Max, 1 ТБ", 134499, "active", ""),
+            ("Нет соответствующей цены в клиентской таблице",),
+        )
+        card = issue_example(issue)
+        self.assertIn("подходящая строка не сопоставлена", card)
+        self.assertIn("Цвет: <b>серебристый</b>", card)
+        self.assertIn("SIM: <b>Только eSIM</b>", card)
 
     def test_keeps_phone_title_for_a_readable_digest_without_matching_on_it(self):
         rows = [["НОВЫЙ", "Lime Store Наличка"], ["iPhone 16E 128Gb black", "57 990"]]

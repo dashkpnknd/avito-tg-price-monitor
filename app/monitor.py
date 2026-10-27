@@ -842,8 +842,15 @@ def issue_example(issue: Issue) -> str:
             "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
         ))
     elif issue.product.source_name == "Автозагрузка":
+        parameters = issue.autoload.parameters if issue.autoload else {}
+        color = parameters.get("color", "")
+        sim_config = parameters.get("simconfig", "")
+        if color:
+            lines.append("🎨 Цвет: <b>%s</b>" % html.escape(color))
+        if sim_config:
+            lines.append("📱 SIM: <b>%s</b>" % html.escape(sim_config))
         lines.extend((
-            "👤 Клиентская таблица: <b>цена не найдена</b>",
+            "👤 Клиентская таблица: <b>подходящая строка не сопоставлена</b>",
             "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
             "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
         ))
