@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import html
 import io
@@ -138,7 +139,7 @@ class Config:
             state_path=Path(os.getenv("STATE_PATH", "data/state.json")),
             check_interval_minutes=positive_int("CHECK_INTERVAL_MINUTES", 60),
             mismatch_grace=timedelta(hours=positive_int("MISMATCH_GRACE_HOURS", 5)),
-            notification_repeat=timedelta(hours=positive_int("NOTIFICATION_REPEAT_HOURS", 24)),
+            notification_repeat=timedelta(hours=positive_int("NOTIFICATION_REPEAT_HOURS", 5)),
             max_avito_pages=positive_int("MAX_AVITO_PAGES", 100),
             dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
         )
@@ -200,6 +201,8 @@ class Issue:
     autoload: Optional[AutoloadRow]
     avito: Optional[AvitoItem]
     reasons: Tuple[str, ...]
+    match_note: str = ""
+    match_category: str = "price_mismatch"
 
     def message(self, elapsed: timedelta) -> str:
         expected = format_price(self.product.price)
@@ -347,7 +350,12 @@ def parse_xlsx_workbook(payload: bytes) -> List[Tuple[str, List[List[str]]]]:
                 elif kind == "inlineStr":
                     values[column] = xlsx_text(node.find("x:is", namespaces))
                 else:
-                    values[column] = raw
+                    # SpreadsheetApp converts numeric 400.0 to "400". Preserve
+                    # literal text, but give XLSX numeric cells the same form.
+                    if kind in {"", "n"} and re.fullmatch(r"[+-]?\d+\.0+", raw):
+                        values[column] = raw[:raw.index(".")]
+                    else:
+                        values[column] = raw
                 hyperlink = hyperlinks.get(node.attrib.get("r", ""), "")
                 if hyperlink.startswith(("https://", "http://")):
                     values[column] = hyperlink
@@ -365,6 +373,11 @@ def normalized(value: object) -> str:
 
 
 def header_name(value: object) -> str:
+    """The exact ``normalizeParamName`` contract of updatePricesFromPriceToAvito.
+
+    Do not add heuristic header detection here.  The price-to-Avito Apps Script
+    is the source of truth for which columns constitute one SKU.
+    """
     value = normalized(value)
     aliases = {
         "model": "model", "модель": "model",
@@ -375,30 +388,11 @@ def header_name(value: object) -> str:
         "imei": "imei", "imeiтелефона": "imei",
         "devicehistory": "devicehistory", "историясмартфона": "devicehistory",
         "set": "set", "комплект": "set",
-        "boxsealed": "boxsealed", "состояниекоробкителефона": "boxsealed",
-        "akb": "akb", "акб": "akb", "состояниеаккумулятораiphone": "akb", "batteryhealth": "akb",
-        "title": "title", "название": "title", "name": "title", "наименование": "title",
+        "boxsealed": "boxsealed", "состояниекоробки": "boxsealed",
+        "akb": "akb", "акб": "akb", "состояниеаккумулятораiphone": "akb", "состояниеаккумулятора": "akb", "batteryhealth": "akb",
+        "title": "title", "название": "title", "name": "title",
     }
-    if value in aliases:
-        return aliases[value]
-    # Autoload templates expose friendly Russian labels plus their technical
-    # Avito field name, e.g. "Заголовок объявления Title". Treat both forms
-    # exactly as the same field instead of requiring the wording to match.
-    if "title" in value or "заголовокобъявлен" in value or "наименование" in value:
-        return "title"
-    if "model" in value or "модель" in value:
-        return "model"
-    if "memorysize" in value or "встроеннаяпамять" in value:
-        return "memorysize"
-    if "ramsize" in value or "оперативнаяпамять" in value:
-        return "ramsize"
-    if "simconfig" in value or "simкарт" in value:
-        return "simconfig"
-    if "color" in value or "colour" in value or value.startswith("цвет"):
-        return "color"
-    if "аккумулятор" in value or "batteryhealth" in value:
-        return "akb"
-    return value
+    return aliases.get(value, value)
 
 
 def is_price_header(value: object) -> bool:
@@ -431,7 +425,15 @@ def find_header_row(rows: Sequence[Sequence[str]]) -> Optional[int]:
 
 
 def cell(row: Sequence[str], index: int) -> str:
-    return str(row[index]).strip() if index < len(row) and row[index] is not None else ""
+    if index >= len(row) or row[index] is None:
+        return ""
+    value = row[index]
+    # SpreadsheetApp.getValues().toString() emits an integer as "400", not
+    # Python's "400.0".  Keeping that display form is required for an exact
+    # reproduction of the Apps Script comparison.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
 
 
 def product_key(source: str, row: int, parameters: Dict[str, str]) -> str:
@@ -548,6 +550,172 @@ COLOR_ALIASES = {
 }
 
 
+MATCH_FIELDS = ("model", "memorysize", "ramsize", "color", "simconfig", "akb")
+FIELD_LABELS = {
+    "model": "Модель",
+    "memorysize": "Память",
+    "ramsize": "RAM",
+    "color": "Цвет",
+    "simconfig": "SIM",
+    "akb": "АКБ",
+    "title": "Название",
+}
+UNKNOWN_VALUES = {"", "незнаю", "unknown", "na", "n/a"}
+
+
+def is_unknown(value: object) -> bool:
+    return normalized(value) in UNKNOWN_VALUES
+
+
+def canonical_memory(value: object) -> str:
+    """Normalise only an unambiguous storage capacity; keep arbitrary text strict."""
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(гб|gb|тб|tb)", text, re.IGNORECASE)
+    if not match:
+        return normalized(text)
+    amount = float(match.group(1).replace(",", "."))
+    if match.group(2).casefold() in {"тб", "tb"}:
+        amount *= 1024
+    return "%sgb" % (int(amount) if amount.is_integer() else amount)
+
+
+def canonical_sim(value: object) -> str:
+    text = normalized(value)
+    if text in UNKNOWN_VALUES:
+        return ""
+    if text in {"2sim", "dualsim", "двесим"}:
+        return "2sim"
+    if text in {"simesim", "simплюсesim"}:
+        return "sim+esim"
+    if text in {"esim", "толькоesim"}:
+        return "esim"
+    return text
+
+
+def canonical_model(value: object) -> str:
+    model = normalized(value)
+    # These are established model aliases, not a fuzzy title comparison.
+    return {"galaxys26+": "galaxys26plus", "iphoneair": "iphone17air"}.get(model, model)
+
+
+def canonical_color(value: object, model: object = "") -> str:
+    """Translate only known spelling/language aliases; never merge distinct finishes."""
+    return phone_color(str(value or ""), str(model or ""))
+
+
+def canonical_parameter(name: str, value: object, model: object = "") -> str:
+    if name == "model":
+        return canonical_model(value)
+    if name == "memorysize":
+        return canonical_memory(value)
+    if name == "simconfig":
+        return canonical_sim(value)
+    if name == "color":
+        return canonical_color(value, model)
+    return normalized(value)
+
+
+def describe_difference(name: str, client_value: str, autoload_value: str) -> str:
+    label = FIELD_LABELS.get(name, name)
+    if not autoload_value:
+        return "%s: у клиента «%s», в автозагрузке пусто" % (label, client_value)
+    return "%s: «%s» ↔ «%s»" % (label, client_value, autoload_value)
+
+
+MATCH_CATEGORY_LABELS = {
+    "different_sim": "Товар найден, отличается SIM",
+    "different_key_parameter": "Товар найден, отличается ключевой параметр",
+    "ambiguous_match": "Неоднозначное сопоставление",
+    "algorithm_error": "Не воспроизведено правилами автозагрузки",
+}
+
+
+def classify_unmatched_client_row(row: AutoloadRow, products: Sequence[Product]) -> Tuple[str, str]:
+    """Diagnose a miss using the same raw fields and strict equality as source.
+
+    This never creates a substitute SKU.  A miss is a failure to reproduce the
+    autoload matcher, not evidence that the client product is absent.
+    """
+    fields_without_sim = ("vendor", "model", "memorysize", "ramsize", "color")
+    nearby = [p for p in products if all(
+        name in p.parameters and name in row.parameters and strict_equal(p.parameters[name], row.parameters[name])
+        for name in fields_without_sim
+    )]
+    if len(nearby) > 1:
+        locations = ", ".join("%s:%s" % (p.source_name, p.row) for p in nearby[:3])
+        return "ambiguous_match", "Неоднозначное сопоставление: найдено %s кандидата (%s)." % (len(nearby), locations)
+    if len(nearby) == 1:
+        candidate = nearby[0]
+        client_sim = candidate.parameters.get("simconfig", "")
+        row_sim = row.parameters.get("simconfig", "")
+        location = "лист «%s», строка %s" % (candidate.source_name, candidate.row)
+        if not strict_equal(client_sim, row_sim):
+            return "different_sim", "Товар найден: %s. Отличается SIM: «%s» ↔ «%s»." % (location, client_sim or "пусто", row_sim or "пусто")
+        return "algorithm_error", "Найден кандидат %s со всеми ключевыми параметрами; требуется проверка алгоритма." % location
+    return "algorithm_error", "Строка не воспроизведена правилами автозагрузки; это не означает отсутствия товара у клиента."
+
+
+def unmatched_client_note(row: AutoloadRow, products: Sequence[Product]) -> str:
+    """Explain a failed strict match without selecting or changing a client row.
+
+    The result is deliberately diagnostic: even one semantically identical row
+    remains an unconfirmed candidate until the strict matcher agrees.
+    """
+    row_model = row.parameters.get("model", "")
+    if row_model:
+        candidates = [
+            product for product in products
+            if product.parameters.get("model")
+            and canonical_model(product.parameters["model"]) == canonical_model(row_model)
+        ]
+    else:
+        row_title = row.parameters.get("title", "")
+        candidates = [
+            product for product in products
+            if row_title and product.parameters.get("title")
+            and normalized(product.parameters["title"]) == normalized(row_title)
+        ]
+    if not candidates:
+        subject = "модель «%s»" % row_model if row_model else "название «%s»" % row.parameters.get("title", "")
+        return "Кандидаты в клиентской таблице не найдены: %s." % subject
+
+    ranked = []
+    for product in candidates:
+        differences = []
+        raw_only = []
+        for name, client_value in product.parameters.items():
+            if name.startswith("_") or not client_value:
+                continue
+            autoload_value = row.parameters.get(name, "")
+            if strict_equal(client_value, autoload_value):
+                continue
+            if canonical_parameter(name, client_value, product.parameters.get("model", "")) == canonical_parameter(
+                name, autoload_value, row.parameters.get("model", "")
+            ):
+                raw_only.append(name)
+            else:
+                differences.append(describe_difference(name, client_value, autoload_value))
+        ranked.append((len(differences), len(raw_only), product, differences, raw_only))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2].source_name, item[2].row))
+    best_difference_count, _, best, differences, raw_only = ranked[0]
+    equally_close = [item for item in ranked if item[:2] == ranked[0][:2]]
+    location = "лист «%s», строка %s" % (best.source_name, best.row)
+    if len(equally_close) > 1:
+        locations = ", ".join("%s:%s" % (item[2].source_name, item[2].row) for item in equally_close[:3])
+        return "Найдено %s одинаково близких кандидата (%s); автоматически не выбрано." % (len(equally_close), locations)
+    if best_difference_count:
+        return "Возможный кандидат: %s. Отличается: %s. Автоматически не сопоставлено." % (
+            location, "; ".join(differences[:3])
+        )
+    if raw_only:
+        labels = ", ".join(FIELD_LABELS.get(name, name) for name in raw_only[:3])
+        return "Возможный кандидат: %s. SKU совпадает после нормализации (%s); автоматически не сопоставлено." % (
+            location, labels
+        )
+    return "Возможный кандидат: %s; автоматически не сопоставлено." % location
+
+
 def phone_color(raw: str, model: str) -> str:
     raw = normalized(raw)
     if raw == "blue":
@@ -616,12 +784,20 @@ def extract_ad_id(headers: Sequence[str], row: Sequence[str]) -> Tuple[Optional[
         item = cell(row, index)
         if not item:
             continue
-        if "ссылка" in name and "объявлен" in name:
+        if "ссылка" in name and ("объявлен" in name or "обьявлен" in name):
             match = re.search(r"(?:_|/)(\d{5,})(?:[/?#]|$)", item)
             if match:
                 return match.group(1), item
-        if name in {"номеробъявления", "объявлениеid", "avitoid"} and re.fullmatch(r"\d{5,}", item):
-            fallback_id = item
+        if name in {"номеробъявления", "номеробьявления", "объявлениеid", "обьявлениеid", "avitoid"}:
+            # Google XLSX exports numeric IDs in scientific notation. Decimal
+            # converts them without floating-point rounding of identifiers.
+            from decimal import Decimal, InvalidOperation
+            try:
+                number = Decimal(item)
+                if number.is_finite() and number == number.to_integral_value() and 10000 <= number < 10 ** 20:
+                    fallback_id = str(int(number))
+            except (InvalidOperation, ValueError, OverflowError):
+                pass
     return fallback_id, ""
 
 
@@ -652,18 +828,21 @@ def extract_autoload_rows(source: SheetSource, rows: Sequence[Sequence[str]]) ->
 
 
 def strict_equal(left: str, right: str) -> bool:
+    """Exact equivalent of the Apps Script's compareStrictValues."""
     return normalized(left) == normalized(right)
 
 
 def product_matches(product: Product, row: AutoloadRow) -> bool:
+    """Exact two-pass SKU match used by updatePricesFromPriceToAvito."""
     for name, value in product.parameters.items():
         if name.startswith("_"):
             continue
-        if not value:
-            continue
+        # The source script checks every price-table parameter, including an
+        # empty one: a missing autoload column is not the same as an empty cell.
         if name not in row.parameters or not strict_equal(value, row.parameters[name]):
             return False
-    # Mirrors the existing synchronisation: AKB is a critical extra field.
+    # Its second pass treats only a non-empty AKB from the Avito row as extra
+    # critical data that must also be present in the price table.
     for name, value in row.parameters.items():
         if name == "akb" and value and (not product.parameters.get(name) or not strict_equal(product.parameters[name], value)):
             return False
@@ -811,8 +990,19 @@ def send_telegram(config: Config, text: str) -> Optional[int]:
     if config.dry_run:
         logging.info("DRY RUN Telegram notification:\n%s", text)
         return None
+    # Use the project-specific state-file name as a stable project identity.
+    # Fail closed if a project has no topic rather than posting to General.
+    mapping_path = config.state_path.parent / "telegram-topics.json"
+    try:
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        topic_id = mapping.get(config.state_path.name)
+    except (OSError, json.JSONDecodeError, AttributeError) as error:
+        raise MonitorError("Telegram project topic mapping is unavailable") from error
+    if not isinstance(topic_id, int) or isinstance(topic_id, bool) or topic_id <= 0:
+        raise MonitorError("Telegram topic is not configured for %s" % config.project_name)
     result = telegram_request(config, "sendMessage", {
         "chat_id": config.telegram_chat_id,
+        "message_thread_id": str(topic_id),
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
@@ -854,6 +1044,10 @@ def issue_example(issue: Issue) -> str:
             "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
             "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
         ))
+        if issue.match_note:
+            lines.append("🔎 %s" % html.escape(issue.match_note))
+        if issue.match_category != "price_mismatch":
+            lines.append("🏷 <b>%s</b>" % html.escape(MATCH_CATEGORY_LABELS.get(issue.match_category, issue.match_category)))
     else:
         lines.extend((
             "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
@@ -909,6 +1103,14 @@ def issue_digests(
         stages.append("🔗 Нет строки или активного объявления: <b>%s</b>" % missing)
     if stages:
         lines.extend(("", "📍 <b>Где не обновилось</b>", *stages))
+    categories = {}
+    for issue in issues:
+        if issue.match_category != "price_mismatch":
+            categories[issue.match_category] = categories.get(issue.match_category, 0) + 1
+    if categories:
+        lines.extend(("", "🧭 <b>Несопоставленные товары</b>"))
+        for category, count in sorted(categories.items()):
+            lines.append("• %s: <b>%s</b>" % (MATCH_CATEGORY_LABELS.get(category, category), count))
     lines.extend(("", "📋 <b>Что проверить</b>"))
     heading = "\n".join(lines)
     continuation = "\n".join((
@@ -940,6 +1142,7 @@ def issue_signature(issues: Sequence[Issue]) -> str:
             issue.autoload.price if issue.autoload else None,
             issue.avito.price if issue.avito else None,
             issue.reasons,
+            issue.match_note,
         ))
     encoded = json.dumps(sorted(items), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -1038,6 +1241,7 @@ class Monitor:
             if row is not None:
                 if item.item_id in matched_active_ids:
                     continue
+                match_category, match_note = classify_unmatched_client_row(row, products)
                 autoload_product = Product(
                     "autoload:%s" % item.item_id,
                     "Автозагрузка",
@@ -1051,10 +1255,25 @@ class Monitor:
                     row,
                     item,
                     ("Нет соответствующей цены в клиентской таблице",),
+                    match_note,
+                    match_category,
                 ))
         return issues
 
     def _notify(self, issues: Sequence[Issue], force_notify: bool = False) -> Tuple[int, int]:
+        # A scheduled check and a manually requested report can finish at the
+        # same time.  Serialise only the state/update phase so they cannot
+        # both read the same prior report and send duplicates.
+        lock_path = self.config.state_path.with_suffix(self.config.state_path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._notify_locked(issues, force_notify=force_notify)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _notify_locked(self, issues: Sequence[Issue], force_notify: bool = False) -> Tuple[int, int]:
         state = load_state(self.config.state_path)
         current = now_utc()
         meta = state.setdefault("__monitor__", {})
@@ -1087,8 +1306,14 @@ class Monitor:
         alerts_sent = 0
         if due:
             signature = issue_signature([issue for issue, _, _ in due])
+            # Manual delivery is useful for a one-off requested check, but a
+            # second click immediately afterwards must not duplicate a full
+            # multi-message report.
+            manual_refresh = force_notify and (
+                last_digest is None or current - last_digest >= timedelta(minutes=5)
+            )
             needs_refresh = (
-                force_notify
+                manual_refresh
                 or
                 previous_signature != signature
                 or last_digest is None

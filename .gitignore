@@ -4,3 +4,19 @@ data/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Local runtime files
+.env.*
+!.env.example
+*.session*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+backups/
+logs/
+sessions/
+secrets/
+profiles/
+._*

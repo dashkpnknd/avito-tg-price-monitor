@@ -16,11 +16,14 @@ from app.monitor import (
     SheetSource,
     extract_autoload_rows,
     extract_products,
+    cell,
+    classify_unmatched_client_row,
     fetch_active_avito_items,
     issue_example,
     issue_digests,
     parse_phone_title,
     product_matches,
+    unmatched_client_note,
     load_state,
 )
 
@@ -119,6 +122,21 @@ class MatchingTests(unittest.TestCase):
                 monitor._notify([issue])
                 deleted.assert_not_called()
 
+    def test_second_manual_report_is_suppressed_for_five_minutes(self):
+        issue = self.notification_issue()
+        started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=started), patch(
+                "app.monitor.send_telegram", return_value=42
+            ):
+                monitor._notify([issue], force_notify=True)
+            with patch("app.monitor.now_utc", return_value=started + timedelta(minutes=2)), patch(
+                "app.monitor.send_telegram"
+            ) as sent:
+                monitor._notify([issue], force_notify=True)
+                sent.assert_not_called()
+
     def test_extracts_google_spreadsheet_id_for_admin_wizard(self):
         self.assertEqual(
             "1abc_DEF-123456789012345",
@@ -139,6 +157,61 @@ class MatchingTests(unittest.TestCase):
         different_memory = AutoloadRow("Авито", 3, {"model": "iPhone 16", "memorysize": "256 ГБ", "color": "черный"}, 59990, "123457", "")
         self.assertTrue(product_matches(product, matching))
         self.assertFalse(product_matches(product, different_memory))
+
+    def test_storage_units_are_not_equated_by_source_matcher(self):
+        product = Product(
+            "client-1", "Телефоны (авито)", 42,
+            {"model": "iPhone 17 Pro Max", "memorysize": "1 ТБ", "color": "серебристый"}, 134499,
+        )
+        row = AutoloadRow(
+            "Авито", 5,
+            {"model": "iPhone 17 Pro Max", "memorysize": "1024 ГБ", "color": "серебристый"},
+            134499, "123", "",
+        )
+        self.assertFalse(product_matches(product, row))
+
+    def test_numeric_sheet_cells_match_apps_script_display_form(self):
+        self.assertEqual("400", cell([400.0], 0))
+
+    def test_classifies_sim_without_creating_a_match(self):
+        product = Product(
+            "client-1", "Телефоны", 395,
+            {"vendor": "HONOR", "model": "400", "memorysize": "256 ГБ", "ramsize": "12 ГБ", "color": "черный", "simconfig": ""}, 34990,
+        )
+        row = AutoloadRow(
+            "Авито", 846,
+            {"vendor": "HONOR", "model": "400", "memorysize": "256 ГБ", "ramsize": "12 ГБ", "color": "черный", "simconfig": "Только eSIM"}, 34990, "123", "",
+        )
+        self.assertFalse(product_matches(product, row))
+        category, note = classify_unmatched_client_row(row, [product])
+        self.assertEqual("different_sim", category)
+        self.assertIn("SIM", note)
+
+    def test_unmatched_note_names_the_field_that_prevents_a_match(self):
+        product = Product(
+            "client-1", "Телефоны (авито)", 42,
+            {"model": "iPhone 17 Pro Max", "memorysize": "1024 ГБ", "color": "серебристый", "simconfig": "Только eSIM"}, 134499,
+        )
+        row = AutoloadRow(
+            "Авито", 5,
+            {"model": "iPhone 17 Pro Max", "memorysize": "1 ТБ", "color": "серебристый", "simconfig": "не знаю"},
+            134499, "123", "",
+        )
+        note = unmatched_client_note(row, [product])
+        self.assertIn("SIM: «Только eSIM» ↔ «не знаю»", note)
+        self.assertNotIn("SKU совпадает", note)
+
+    def test_unmatched_note_never_picks_between_equally_close_candidates(self):
+        products = [
+            Product("one", "Телефоны (авито)", 42, {"model": "iPhone 17", "memorysize": "128 ГБ", "color": "черный"}, 1),
+            Product("two", "Телефоны (авито)", 43, {"model": "iPhone 17", "memorysize": "128 ГБ", "color": "белый"}, 1),
+        ]
+        row = AutoloadRow(
+            "Авито", 5, {"model": "iPhone 17", "memorysize": "128 ГБ", "color": "красный"}, 1, "123", ""
+        )
+        note = unmatched_client_note(row, products)
+        self.assertIn("2 одинаково близких кандидата", note)
+        self.assertIn("автоматически не выбрано", note)
 
     def test_extracts_avito_id_from_url(self):
         rows = [
@@ -203,6 +276,16 @@ class MatchingTests(unittest.TestCase):
         self.assertIn("подходящая строка не сопоставлена", card)
         self.assertIn("Цвет: <b>серебристый</b>", card)
         self.assertIn("SIM: <b>Только eSIM</b>", card)
+
+    def test_renders_diagnostic_note_for_an_unmatched_client_row(self):
+        autoload = AutoloadRow("Avito", 2, {"title": "iPhone", "model": "iPhone 17"}, 100, "123", "")
+        issue = Issue(
+            "missing-client", Product("autoload:123", "Автозагрузка", 2, {"title": "iPhone"}, 100),
+            autoload, AvitoItem("123", "iPhone", 100, "active", ""),
+            ("Нет соответствующей цены в клиентской таблице",),
+            "Возможный кандидат: лист «Телефоны», строка 42. Отличается: SIM.",
+        )
+        self.assertIn("Возможный кандидат", issue_example(issue))
 
     def test_keeps_phone_title_for_a_readable_digest_without_matching_on_it(self):
         rows = [["НОВЫЙ", "Lime Store Наличка"], ["iPhone 16E 128Gb black", "57 990"]]
