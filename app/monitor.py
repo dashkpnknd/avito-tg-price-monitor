@@ -246,7 +246,9 @@ def http_text(url: str, method: str = "GET", data: Optional[bytes] = None, heade
             return response.read().decode("utf-8")
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")[:500]
-        raise MonitorError("HTTP %s for %s: %s" % (error.code, url, body)) from error
+        retry_after = error.headers.get("Retry-After", "") if error.headers else ""
+        retry_hint = " Retry-After: %s" % retry_after if str(retry_after).isdigit() else ""
+        raise MonitorError("HTTP %s for %s: %s%s" % (error.code, url, body, retry_hint)) from error
     except URLError as error:
         raise MonitorError("Network error for %s: %s" % (url, error.reason)) from error
 
@@ -976,8 +978,11 @@ def avito_json(url: str, headers: Dict[str, str]) -> Dict[str, object]:
             # as absent.
             if "HTTP 429" not in str(last_error) or attempt == 4:
                 raise last_error
-            retry_after = re.search(r"retry after\s*(\d+)", str(last_error), re.IGNORECASE)
-            time.sleep(min(int(retry_after.group(1)) if retry_after else 2 ** attempt, 30))
+            retry_after = re.search(r"retry[- ]after\s*:\s*(\d+)", str(last_error), re.IGNORECASE)
+            # A minute-long account window cannot reset during the previous
+            # 1/2/4/8-second retry sequence; use the server hint when present.
+            delay = int(retry_after.group(1)) if retry_after else 60
+            time.sleep(min(max(delay, 1), 120))
     raise last_error or MonitorError("Avito request failed")
 
 

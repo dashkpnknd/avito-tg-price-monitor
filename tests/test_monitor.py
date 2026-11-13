@@ -18,6 +18,7 @@ from app.monitor import (
     extract_products,
     cell,
     classify_unmatched_client_row,
+    avito_json,
     fetch_active_avito_items,
     issue_example,
     issue_digests,
@@ -446,6 +447,19 @@ class MatchingTests(unittest.TestCase):
             with patch("app.monitor.get_avito_token", return_value="token"), patch("app.monitor.avito_json", return_value=payload):
                 items = fetch_active_avito_items(config)
         self.assertEqual(["1"], list(items))
+
+    def test_rate_limit_waits_for_the_retry_window_without_a_live_request(self):
+        with patch("app.monitor.http_text", side_effect=[MonitorError("HTTP 429 for Avito"), '{"resources": []}']) as request, patch("app.monitor.time.sleep") as sleep:
+            payload = avito_json("https://example.test/items", {})
+        self.assertEqual([], payload["resources"])
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once_with(60)
+
+    def test_rate_limit_respects_retry_after_header(self):
+        with patch("app.monitor.http_text", side_effect=[MonitorError("HTTP 429 for Avito: Retry-After: 90"), '{}']) as request, patch("app.monitor.time.sleep") as sleep:
+            self.assertEqual({}, avito_json("https://example.test/items", {}))
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once_with(90)
 
     def test_unlinked_client_row_does_not_claim_the_product_is_missing(self):
         autoload = AutoloadRow(
