@@ -102,11 +102,12 @@ class Config:
 
         client_spreadsheet_id = str(raw.get("client_spreadsheet_id") or "").strip()
         autoload_spreadsheet_id = str(raw.get("autoload_spreadsheet_id") or "").strip()
-        # New projects only need the workbook itself.  The monitor discovers
-        # every tab marked '(авито)' at each check.  client_sources is kept as
+        # New projects only need the workbook itself. The source script scans
+        # every price-bearing tab when its optional sheet name is blank.
+        # client_sources is kept as
         # a backwards-compatible input for already configured projects.
         client_sources = (
-            (SheetSource("Все листы (авито)", client_spreadsheet_id, ""),)
+            (SheetSource("Все листы прайса", client_spreadsheet_id, ""),)
             if client_spreadsheet_id
             else sources("client_sources")
         )
@@ -474,12 +475,17 @@ def extract_products(source: SheetSource, rows: Sequence[Sequence[str]], include
     return products
 
 
-def fetch_avito_template_products(spreadsheet_id: str, include_unpriced: bool = False) -> List[Product]:
-    """Return every client product from tabs explicitly marked '(авито)'."""
+def fetch_script_price_products(spreadsheet_id: str, include_unpriced: bool = False) -> List[Product]:
+    """Read the same price-bearing tabs and tab order as getProductsFromPrice.
+
+    The source script scans every tab when its optional sheet name is blank.
+    A retained autoload price may therefore have come from a tab without an
+    '(авито)' suffix; filtering those tabs would invent a missing client row.
+    """
     payload = http_bytes(GOOGLE_XLSX_EXPORT.format(sheet_id=spreadsheet_id))
     products: List[Product] = []
     for name, rows in parse_xlsx_workbook(payload):
-        if "(авито)" not in name.lower():
+        if find_header_row(rows) is None:
             continue
         products.extend(extract_products(SheetSource(name, spreadsheet_id, name), rows, include_unpriced=include_unpriced))
     return products
@@ -705,7 +711,7 @@ def unmatched_client_note(row: AutoloadRow, products: Sequence[Product]) -> str:
         ]
     if not candidates:
         subject = "модель «%s»" % row_model if row_model else "название «%s»" % row.parameters.get("title", "")
-        return "Кандидаты в клиентской таблице не найдены: %s." % subject
+        return "Не удалось подтвердить клиентскую строку по текущим данным: %s." % subject
 
     ranked = []
     for product in candidates:
@@ -1063,7 +1069,7 @@ def save_state(path: Path, state: Dict[str, Dict[str, str]]) -> None:
 
 
 def format_price(value: Optional[int]) -> str:
-    return ("{:,}".format(value).replace(",", " ") + " ₽") if value is not None else "не найдено"
+    return ("{:,}".format(value).replace(",", " ") + " ₽") if value is not None else "цена не указана"
 
 
 def format_duration(value: timedelta) -> str:
@@ -1303,7 +1309,7 @@ class Monitor:
         else:
             client = []
             for spreadsheet_id in self.config.client_spreadsheet_ids:
-                client.extend(fetch_avito_template_products(spreadsheet_id, include_unpriced=True))
+                client.extend(fetch_script_price_products(spreadsheet_id, include_unpriced=True))
         named_autoload_sources = [source for source in self.config.autoload_sources if named_tab_source(source)]
         if named_autoload_sources:
             autoload = fetch_named_autoload_rows(named_autoload_sources)

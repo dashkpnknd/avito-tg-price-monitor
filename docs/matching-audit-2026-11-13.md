@@ -15,6 +15,7 @@ No manual Avito API calls were made for this audit.
 | Autoload and Avito prices differ while the client row cannot be priced | Independent values are available in both places | Report only the confirmed autoload-to-Avito discrepancy |
 | Avito list rate limit prevents a city's check | The routine run stopped at listing page 25/26 with HTTP 429 for Sachkoff Omsk, KingStore Nizhnevartovsk, and APPHUB Ekaterinburg. | Use `Retry-After` when supplied; otherwise wait a full minute before retrying the same page. Do not send a partial city's report. |
 | Client has only `Title` and `Price` for consoles | iHub Noyabrsk client `пс` rows 3–5 append `Гарантия` and/or `Рассрочка`; autoload `Avito - Игровые приставки` rows 3–5 omit them and have a `Model` column absent from the client sheet. | Compare complete titles after removing only those trailing sale terms and a spaced ` + ` delimiter; preserve `Дисковод` and model variants. This rule applies to every title-only sheet. |
+| Monitor selected fewer client tabs than the script | Control workbook `Параметры` rows 2–10 has a blank `ЛИСТ` column for all running accounts. Thus `getProductsFromPrice` scans all tabs with a `Price` header, while the monitor previously used only registered category tabs or tabs marked `(авито)`. | Read all price-bearing tabs in workbook order for ordinary client sheets; retain explicit tab handling for special legacy layouts. |
 
 The routine run after the blank-price change identified 46 unpriced client
 matches in SOTIKS Ivanovo, 12 in Kaluga, 11 in Geek Choice Belgorod, six in
@@ -44,3 +45,11 @@ The iHub Noyabrsk routine run reduced its unmatched active listings to three
 PlayStation rows. The linked sheets confirm the exact client and autoload
 titles, so the title-only rule above addresses this pattern globally. No
 additional sheet copies are needed for the current matching changes.
+
+The next natural server run after the title rule completed iHub Noyabrsk with
+no unmatched warning (31 confirmed price differences, zero alerts before the
+grace period). Kaluga still logged five unmatched iPhone 17 rows; its saved
+source-script report itself marks autoload row 383 `Нет в прайсе`. LimeStore
+Gatchina's saved script report likewise marks Galaxy Watch 9 autoload row 69
+`Нет в прайсе`. These are not evidence that the monitor failed to reproduce a
+successful script match.

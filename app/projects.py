@@ -58,11 +58,11 @@ def config_for_project(base: Config, project: Dict[str, object]) -> Config:
         raise MonitorError("Project registry contains invalid client tab names")
     if autoload_tab_names is not None and (not isinstance(autoload_tab_names, list) or not all(isinstance(tab, str) and tab.strip() for tab in autoload_tab_names)):
         raise MonitorError("Project registry contains invalid autoload tab names")
-    client_sources = (
-        tuple(SheetSource(tab.strip(), client_sheet, "tab:" + tab.strip()) for tab in client_tab_names)
-        if client_tab_names
-        else (SheetSource("Все листы (авито)", client_sheet, ""),)
-    )
+    # The existing price-to-Avito script's control table leaves its optional
+    # sheet-name column blank, so it searches every price-bearing client tab.
+    # Historical client_tab_names list categories for setup; using them as a
+    # filter here made the monitor see fewer products than the source script.
+    client_sources = (SheetSource("Все листы прайса", client_sheet, ""),)
     autoload_sources = (
         tuple(SheetSource(tab.strip(), autoload_sheet, "tab:" + tab.strip()) for tab in autoload_tab_names)
         if autoload_tab_names

@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from app.admin_bot import spreadsheet_id
+from app.projects import config_for_project
 from app.monitor import (
     AvitoItem,
     AutoloadRow,
@@ -16,6 +17,7 @@ from app.monitor import (
     SheetSource,
     extract_autoload_rows,
     extract_products,
+    fetch_script_price_products,
     cell,
     classify_unmatched_client_row,
     canonical_title,
@@ -195,6 +197,30 @@ class MatchingTests(unittest.TestCase):
             "456": AvitoItem("456", "Xiaomi 17 Ultra", 109990, "active", ""),
         }
         self.assertEqual([], Monitor(None)._find_issues(products, [pixel, xiaomi], active))
+
+    def test_script_price_reader_uses_all_price_tabs_in_workbook_order(self):
+        sheets = [
+            ("Основной прайс", [["Model", "Color", "Price"], ["Pixel 10", "синий", "73990"]]),
+            ("Рабочий лист", [["Model", "Color"], ["Pixel 10", "синий"]]),
+            ("Телефоны (авито)", [["Model", "Color", "Price"], ["Pixel 10", "синий", "74990"]]),
+        ]
+        with patch("app.monitor.http_bytes", return_value=b"xlsx"), patch("app.monitor.parse_xlsx_workbook", return_value=sheets):
+            products = fetch_script_price_products("client-id")
+        self.assertEqual(["Основной прайс", "Телефоны (авито)"], [p.source_name for p in products])
+        row = AutoloadRow("Avito - Мобильные телефоны", 3, {"model": "Pixel 10", "color": "синий"}, 73990, "1", "")
+        self.assertEqual([products[0], products[1]], matching_client_products(row, products))
+        self.assertEqual([], Monitor(None)._find_issues(products, [row], {
+            "1": AvitoItem("1", "Pixel 10", 73990, "active", "")
+        }))
+
+    def test_registry_category_list_does_not_limit_script_price_tabs(self):
+        base = self.notification_config("/tmp")
+        project = config_for_project(base, {
+            "name": "Город", "client_spreadsheet_id": "client-id", "autoload_spreadsheet_id": "autoload-id",
+            "avito_client_id": "id", "avito_client_secret": "secret", "client_tab_names": ["Телефоны"],
+        })
+        self.assertEqual("Все листы прайса", project.client_sources[0].name)
+        self.assertFalse(project.client_sources[0].gid.startswith("tab:"))
 
     def test_all_script_metadata_aliases_are_ignored_on_both_sides(self):
         for alias in ("Причина без цены", "Причина отсутствия цены", "Reason Without Price", "Missing Price Reason"):
@@ -534,6 +560,12 @@ class MatchingTests(unittest.TestCase):
             "Возможный кандидат: лист «Телефоны», строка 42. Отличается: SIM.",
         )
         self.assertIn("Возможный кандидат", issue_example(issue))
+
+    def test_unmatched_diagnostic_does_not_claim_client_product_is_absent(self):
+        row = AutoloadRow("Avito - Смарт-часы", 69, {"title": "Samsung Galaxy Watch 9 44mm Silver"}, 25990, "123", "")
+        note = unmatched_client_note(row, [])
+        self.assertIn("Не удалось подтвердить клиентскую строку", note)
+        self.assertNotIn("в клиентской таблице не найдены", note)
 
     def test_unlinked_client_still_checks_autoload_price_against_avito(self):
         row = AutoloadRow("Avito - Мобильные телефоны", 777, {
