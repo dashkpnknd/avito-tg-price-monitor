@@ -23,6 +23,7 @@ from app.monitor import (
     issue_digests,
     parse_phone_title,
     product_matches,
+    matching_client_products,
     unmatched_client_note,
     load_state,
 )
@@ -169,6 +170,82 @@ class MatchingTests(unittest.TestCase):
             134499, "123", "",
         )
         self.assertFalse(product_matches(product, row))
+
+    def test_android_template_metadata_does_not_block_matching(self):
+        rows = [
+            ["Причина без цены", "Vendor", "Model", "SimConfig", "Color", "MemorySize", "RamSize", "Price"],
+            ["", "Google", "Pixel 10", "SIM + eSIM", "синий", "256 ГБ", "12 ГБ", "73990"],
+            ["", "Xiaomi", "17 Ultra", "SIM + eSIM", "белый", "512 ГБ", "16 ГБ", "109990"],
+        ]
+        products = extract_products(SheetSource("Телефоны", "id", "gid"), rows)
+        self.assertNotIn("причинабезцены", products[0].parameters)
+        pixel = AutoloadRow("Авито", 775, {
+            "vendor": "Google", "model": "Pixel 10", "simconfig": "SIM + eSIM",
+            "color": "синий", "memorysize": "256 ГБ", "ramsize": "12 ГБ",
+        }, 73990, "123", "")
+        xiaomi = AutoloadRow("Авито", 757, {
+            "vendor": "Xiaomi", "model": "17 Ultra", "simconfig": "SIM + eSIM",
+            "color": "белый", "memorysize": "512 ГБ", "ramsize": "16 ГБ",
+        }, 109990, "456", "")
+        active = {
+            "123": AvitoItem("123", "Google Pixel 10", 73990, "active", ""),
+            "456": AvitoItem("456", "Xiaomi 17 Ultra", 109990, "active", ""),
+        }
+        self.assertEqual([], Monitor(None)._find_issues(products, [pixel, xiaomi], active))
+
+    def test_all_script_metadata_aliases_are_ignored_on_both_sides(self):
+        for alias in ("Причина без цены", "Причина отсутствия цены", "Reason Without Price", "Missing Price Reason"):
+            with self.subTest(alias=alias):
+                product = extract_products(
+                    SheetSource("Телефоны", "id", "gid"),
+                    [[alias, "Model", "Color", "Price"], ["", "Pixel 10", "синий", "73990"]],
+                )[0]
+                row = extract_autoload_rows(
+                    SheetSource("Avito", "id", "gid"),
+                    [[alias, "Model", "Color", "Price", "Ссылка на объявление"],
+                     ["", "Pixel 10", "синий", "73990", "https://www.avito.ru/x_123456"]],
+                )[0]
+                self.assertTrue(product_matches(product, row))
+                self.assertEqual({"model", "color"}, set(product.parameters))
+                self.assertNotIn(alias.lower().replace(" ", ""), row.parameters)
+
+    def test_source_uses_first_exact_row_and_distinct_color_stays_distinct(self):
+        products = [
+            Product("one", "Телефоны", 10, {"model": "17 Ultra", "memorysize": "1024 ГБ", "color": "белый"}, 123990),
+            Product("two", "Телефоны", 11, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 124990),
+            Product("three", "Телефоны", 12, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "черный"}, 124990),
+        ]
+        row = AutoloadRow("Авито", 100, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 124990, "1", "")
+        self.assertEqual([products[1]], matching_client_products(row, products))
+        self.assertFalse(product_matches(products[2], row))
+
+    def test_source_uses_first_row_for_duplicate_skus(self):
+        products = [
+            Product("one", "Телефоны", 10, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 123990),
+            Product("two", "Телефоны", 11, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 124990),
+        ]
+        row = AutoloadRow("Авито", 100, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 123990, "1", "")
+        active = {"1": AvitoItem("1", "Xiaomi 17 Ultra", 123990, "active", "")}
+        issues = Monitor(None)._find_issues(products, [row], active)
+        self.assertEqual([], issues)
+
+    def test_live_log_xiaomi_1024gb_remains_unmatched_with_a_candidate(self):
+        # The price-to-Avito log for KingStore Нижневартовск marks Avito R757
+        # "Нет в прайсе" and client R302 "Нет в Авито" on 2026-11-13.
+        client = Product("xiaomi", "Телефоны", 302, {
+            "vendor": "Xiaomi", "model": "17 Ultra", "simconfig": "SIM + eSIM",
+            "color": "белый", "memorysize": "1024 ГБ", "ramsize": "16 ГБ",
+        }, 123990)
+        row = AutoloadRow("Avito - Мобильные телефоны", 757, {
+            "vendor": "Xiaomi", "model": "17 Ultra", "simconfig": "SIM + eSIM",
+            "color": "белый", "memorysize": "1 ТБ", "ramsize": "16 ГБ",
+        }, 123990, "8577805795", "")
+        active = {row.ad_id: AvitoItem(row.ad_id, "Xiaomi 17 Ultra", 123990, "active", "")}
+        issues = Monitor(None)._find_issues([client], [row], active)
+        self.assertEqual(1, len(issues))
+        self.assertIn("Память", issues[0].match_note)
+        self.assertIn("строка 302", issues[0].match_note)
+        self.assertEqual(("Строка клиентской таблицы не сопоставлена",), issues[0].reasons)
 
     def test_numeric_sheet_cells_match_apps_script_display_form(self):
         self.assertEqual("400", cell([400.0], 0))

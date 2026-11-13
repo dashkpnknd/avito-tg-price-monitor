@@ -378,7 +378,7 @@ def header_name(value: object) -> str:
     Do not add heuristic header detection here.  The price-to-Avito Apps Script
     is the source of truth for which columns constitute one SKU.
     """
-    value = normalized(value)
+    value = re.sub(r"[^a-zа-я0-9]", "", str(value or "").lower()).replace("ё", "е")
     aliases = {
         "model": "model", "модель": "model",
         "memorysize": "memorysize", "встроеннаяпамять": "memorysize",
@@ -388,7 +388,7 @@ def header_name(value: object) -> str:
         "imei": "imei", "imeiтелефона": "imei",
         "devicehistory": "devicehistory", "историясмартфона": "devicehistory",
         "set": "set", "комплект": "set",
-        "boxsealed": "boxsealed", "состояниекоробки": "boxsealed",
+        "boxsealed": "boxsealed", "состояниекоробкителефона": "boxsealed",
         "akb": "akb", "акб": "akb", "состояниеаккумулятораiphone": "akb", "состояниеаккумулятора": "akb", "batteryhealth": "akb",
         "title": "title", "название": "title", "name": "title",
     }
@@ -396,7 +396,7 @@ def header_name(value: object) -> str:
 
 
 def is_price_header(value: object) -> bool:
-    return "price" in normalized(value)
+    return "price" in str(value or "").lower()
 
 
 def parse_price(value: object) -> Optional[int]:
@@ -454,7 +454,13 @@ def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List
     products: List[Product] = []
     for position, price_column in enumerate(price_columns):
         start = price_columns[position - 1] + 1 if position else 0
-        fields = [(index, header_name(headers[index])) for index in range(start, price_column) if cell(headers, index)]
+        fields = [
+            (index, name)
+            for index in range(start, price_column)
+            if cell(headers, index)
+            for name in (header_name(headers[index]),)
+            if name not in CLIENT_METADATA_FIELDS
+        ]
         for row_number, row in enumerate(rows[header_row + 1 :], start=header_row + 2):
             price = parse_price(cell(row, price_column))
             if price is None:
@@ -561,6 +567,12 @@ FIELD_LABELS = {
     "title": "Название",
 }
 UNKNOWN_VALUES = {"", "незнаю", "unknown", "na", "n/a"}
+# This column explains why a price is blank in the client template. It is
+# operational metadata, not a product parameter exported to Avito.
+CLIENT_METADATA_FIELDS = {
+    "причинабезцены", "причинаотсутствияцены",
+    "reasonwithoutprice", "missingpricereason",
+}
 
 
 def is_unknown(value: object) -> bool:
@@ -810,7 +822,13 @@ def extract_autoload_rows(source: SheetSource, rows: Sequence[Sequence[str]]) ->
     price_column = next((index for index, value in enumerate(headers) if is_price_header(value)), None)
     if price_column is None:
         return []
-    fields = [(index, header_name(value)) for index, value in enumerate(headers) if index != price_column and cell(headers, index)]
+    fields = [
+        (index, name)
+        for index, value in enumerate(headers)
+        if index != price_column and cell(headers, index)
+        for name in (header_name(value),)
+        if name not in CLIENT_METADATA_FIELDS
+    ]
     result: List[AutoloadRow] = []
     for row_number, row in enumerate(rows[header_row + 1 :], start=header_row + 2):
         parameters = {name: cell(row, index) for index, name in fields}
@@ -829,17 +847,25 @@ def extract_autoload_rows(source: SheetSource, rows: Sequence[Sequence[str]]) ->
 
 def strict_equal(left: str, right: str) -> bool:
     """Exact equivalent of the Apps Script's compareStrictValues."""
-    return normalized(left) == normalized(right)
+    def script_value(value: object) -> str:
+        # normalizeValue in the existing price-to-Avito script does not use
+        # Unicode compatibility folding or replace ё before its character
+        # filter. Keep this comparison separate from diagnostic normalization.
+        return re.sub(r"[^a-zа-я0-9+]", "", str(value or "").lower().strip())
+
+    return script_value(left) == script_value(right)
 
 
 def product_matches(product: Product, row: AutoloadRow) -> bool:
-    """Exact two-pass SKU match used by updatePricesFromPriceToAvito."""
+    """Apply the two checks in updatePricesFromPriceToAvito."""
     for name, value in product.parameters.items():
-        if name.startswith("_"):
+        if name.startswith("_") or name in CLIENT_METADATA_FIELDS:
             continue
         # The source script checks every price-table parameter, including an
         # empty one: a missing autoload column is not the same as an empty cell.
-        if name not in row.parameters or not strict_equal(value, row.parameters[name]):
+        if name not in row.parameters:
+            return False
+        if not strict_equal(value, row.parameters[name]):
             return False
     # Its second pass treats only a non-empty AKB from the Avito row as extra
     # critical data that must also be present in the price table.
@@ -847,6 +873,11 @@ def product_matches(product: Product, row: AutoloadRow) -> bool:
         if name == "akb" and value and (not product.parameters.get(name) or not strict_equal(product.parameters[name], value)):
             return False
     return True
+
+
+def matching_client_products(row: AutoloadRow, products: Sequence[Product]) -> List[Product]:
+    """Return source matches in price-sheet order; the script uses the first."""
+    return [product for product in products if product_matches(product, row)]
 
 
 def is_used_item(row: AutoloadRow) -> bool:
@@ -1208,40 +1239,29 @@ class Monitor:
 
     def _find_issues(self, products: Sequence[Product], rows: Sequence[AutoloadRow], active: Dict[str, AvitoItem]) -> List[Issue]:
         issues: List[Issue] = []
-        matched_active_ids = set()
         monitored_rows = [row for row in rows if is_used_item(row)]
-        for product in products:
-            matched = [row for row in monitored_rows if product_matches(product, row)]
-            active_matches = [row for row in matched if row.ad_id and row.ad_id in active]
-            # A client price can legitimately remain for a product whose old
-            # Autoload row is archived or whose listing is not published yet.
-            # The monitor's scope is active Avito ads, so it checks only rows
-            # currently confirmed as active by the profile API.
-            if not active_matches:
-                continue
-            for row in active_matches:
-                avito = active.get(row.ad_id or "")
-                if row.ad_id:
-                    matched_active_ids.add(row.ad_id)
-                reasons: List[str] = []
-                if row.price != product.price:
-                    reasons.append("цена не дошла из клиентской таблицы в автозагрузку")
-                if not row.ad_id:
-                    reasons.append("у строки автозагрузки нет ID объявления Авито")
-                elif avito is None:
-                    reasons.append("объявление не активно или не найдено в профиле Авито")
-                elif row.price != avito.price:
-                    reasons.append("цена не дошла из автозагрузки в Авито")
-                if reasons:
-                    identifier = row.ad_id or (row.source_name + ":" + str(row.row))
-                    issues.append(Issue("%s:%s" % (product.key, identifier), product, row, avito, tuple(reasons)))
+        # A client price can legitimately remain for an archived or unpublished
+        # product. Only autoload rows confirmed active by Avito are checked.
         active_autoload = {row.ad_id: row for row in monitored_rows if row.ad_id and row.ad_id in active}
         for item in active.values():
             row = active_autoload.get(item.item_id)
-            if row is not None:
-                if item.item_id in matched_active_ids:
-                    continue
+            if row is None:
+                continue
+            matches = matching_client_products(row, products)
+            if matches:
+                product = matches[0]
+                reasons: List[str] = []
+                if row.price != product.price:
+                    reasons.append("цена не дошла из клиентской таблицы в автозагрузку")
+                if row.price != item.price:
+                    reasons.append("цена не дошла из автозагрузки в Авито")
+                if reasons:
+                    issues.append(Issue("%s:%s" % (product.key, item.item_id), product, row, item, tuple(reasons)))
+            else:
                 match_category, match_note = classify_unmatched_client_row(row, products)
+                candidate_note = unmatched_client_note(row, products)
+                if candidate_note:
+                    match_note = candidate_note
                 autoload_product = Product(
                     "autoload:%s" % item.item_id,
                     "Автозагрузка",
@@ -1254,7 +1274,7 @@ class Monitor:
                     autoload_product,
                     row,
                     item,
-                    ("Нет соответствующей цены в клиентской таблице",),
+                    ("Строка клиентской таблицы не сопоставлена",),
                     match_note,
                     match_category,
                 ))
