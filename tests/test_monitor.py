@@ -170,6 +170,7 @@ class MatchingTests(unittest.TestCase):
             134499, "123", "",
         )
         self.assertFalse(product_matches(product, row))
+        self.assertEqual([product], matching_client_products(row, [product]))
 
     def test_android_template_metadata_does_not_block_matching(self):
         rows = [
@@ -229,7 +230,7 @@ class MatchingTests(unittest.TestCase):
         issues = Monitor(None)._find_issues(products, [row], active)
         self.assertEqual([], issues)
 
-    def test_live_log_xiaomi_1024gb_remains_unmatched_with_a_candidate(self):
+    def test_live_log_xiaomi_1024gb_matches_client_without_false_alert(self):
         # The price-to-Avito log for KingStore Нижневартовск marks Avito R757
         # "Нет в прайсе" and client R302 "Нет в Авито" on 2026-11-13.
         client = Product("xiaomi", "Телефоны", 302, {
@@ -242,10 +243,40 @@ class MatchingTests(unittest.TestCase):
         }, 123990, "8577805795", "")
         active = {row.ad_id: AvitoItem(row.ad_id, "Xiaomi 17 Ultra", 123990, "active", "")}
         issues = Monitor(None)._find_issues([client], [row], active)
+        self.assertEqual([], issues)
+        self.assertEqual([client], matching_client_products(row, [client]))
+        active[row.ad_id] = AvitoItem(row.ad_id, "Xiaomi 17 Ultra", 124990, "active", "")
+        issues = Monitor(None)._find_issues([client], [row], active)
         self.assertEqual(1, len(issues))
-        self.assertIn("Память", issues[0].match_note)
-        self.assertIn("строка 302", issues[0].match_note)
-        self.assertEqual(("Строка клиентской таблицы не сопоставлена",), issues[0].reasons)
+        self.assertEqual(client, issues[0].product)
+        self.assertEqual(("цена не дошла из автозагрузки в Авито",), issues[0].reasons)
+
+    def test_android_brand_prefix_and_ram_units_match_only_when_vendor_agrees(self):
+        client = Product("pixel", "Телефоны", 42, {
+            "vendor": "Google", "model": "Pixel 10", "memorysize": "256 ГБ",
+            "ramsize": "12 GB", "color": "синий", "simconfig": "SIM + eSIM",
+        }, 73990)
+        row = AutoloadRow("Автозагрузка", 100, {
+            "vendor": "Google", "model": "Google Pixel 10", "memorysize": "256 GB",
+            "ramsize": "12 ГБ", "color": "синий", "simconfig": "SIM + eSIM",
+        }, 73990, "123", "")
+        self.assertEqual([client], matching_client_products(row, [client]))
+        wrong_vendor = AutoloadRow(row.source_name, row.row, {**row.parameters, "vendor": "Xiaomi"}, row.price, row.ad_id, row.url)
+        self.assertEqual([], matching_client_products(wrong_vendor, [client]))
+        wrong_color = AutoloadRow(row.source_name, row.row, {**row.parameters, "color": "черный"}, row.price, row.ad_id, row.url)
+        self.assertEqual([], matching_client_products(wrong_color, [client]))
+
+    def test_ambiguous_equivalent_rows_do_not_claim_a_client_price(self):
+        clients = [
+            Product("one", "Телефоны", 42, {"model": "17 Ultra", "memorysize": "1024 ГБ", "color": "белый"}, 123990),
+            Product("two", "Телефоны", 43, {"model": "17 Ultra", "memorysize": "1024 GB", "color": "белый"}, 124990),
+        ]
+        row = AutoloadRow("Автозагрузка", 100, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 123990, "123", "")
+        self.assertEqual([], matching_client_products(row, clients))
+        with self.assertLogs(level="WARNING") as logs:
+            issues = Monitor(None)._find_issues(clients, [row], {"123": AvitoItem("123", "Xiaomi 17 Ultra", 123990, "active", "")})
+        self.assertEqual([], issues)
+        self.assertIn("without a confident client match", logs.output[0])
 
     def test_numeric_sheet_cells_match_apps_script_display_form(self):
         self.assertEqual("400", cell([400.0], 0))

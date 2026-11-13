@@ -604,8 +604,11 @@ def canonical_sim(value: object) -> str:
     return text
 
 
-def canonical_model(value: object) -> str:
+def canonical_model(value: object, vendor: object = "") -> str:
     model = normalized(value)
+    brand = normalized(vendor)
+    if brand and model.startswith(brand) and len(model) > len(brand):
+        model = model[len(brand):]
     # These are established model aliases, not a fuzzy title comparison.
     return {"galaxys26+": "galaxys26plus", "iphoneair": "iphone17air"}.get(model, model)
 
@@ -615,10 +618,10 @@ def canonical_color(value: object, model: object = "") -> str:
     return phone_color(str(value or ""), str(model or ""))
 
 
-def canonical_parameter(name: str, value: object, model: object = "") -> str:
+def canonical_parameter(name: str, value: object, model: object = "", vendor: object = "") -> str:
     if name == "model":
-        return canonical_model(value)
-    if name == "memorysize":
+        return canonical_model(value, vendor)
+    if name in {"memorysize", "ramsize"}:
         return canonical_memory(value)
     if name == "simconfig":
         return canonical_sim(value)
@@ -678,7 +681,8 @@ def unmatched_client_note(row: AutoloadRow, products: Sequence[Product]) -> str:
         candidates = [
             product for product in products
             if product.parameters.get("model")
-            and canonical_model(product.parameters["model"]) == canonical_model(row_model)
+            and canonical_model(product.parameters["model"], product.parameters.get("vendor", ""))
+            == canonical_model(row_model, row.parameters.get("vendor", ""))
         ]
     else:
         row_title = row.parameters.get("title", "")
@@ -701,8 +705,8 @@ def unmatched_client_note(row: AutoloadRow, products: Sequence[Product]) -> str:
             autoload_value = row.parameters.get(name, "")
             if strict_equal(client_value, autoload_value):
                 continue
-            if canonical_parameter(name, client_value, product.parameters.get("model", "")) == canonical_parameter(
-                name, autoload_value, row.parameters.get("model", "")
+            if canonical_parameter(name, client_value, product.parameters.get("model", ""), product.parameters.get("vendor", "")) == canonical_parameter(
+                name, autoload_value, row.parameters.get("model", ""), row.parameters.get("vendor", "")
             ):
                 raw_only.append(name)
             else:
@@ -875,9 +879,45 @@ def product_matches(product: Product, row: AutoloadRow) -> bool:
     return True
 
 
+def semantic_product_matches(product: Product, row: AutoloadRow) -> bool:
+    """Match equivalent SKU values when the source script's text differs.
+
+    Every client field must still be present, and a non-empty Avito AKB must
+    agree.  A brand prefix in Model is ignored only if Vendor agrees on both
+    sides.  This is used only after the source script's exact match fails.
+    """
+    vendor = product.parameters.get("vendor", "")
+    row_vendor = row.parameters.get("vendor", "")
+    same_vendor = bool(vendor and row_vendor and normalized(vendor) == normalized(row_vendor))
+    if not product.parameters.get("model") or not row.parameters.get("model"):
+        return False
+    for name, value in product.parameters.items():
+        if name.startswith("_") or name in CLIENT_METADATA_FIELDS:
+            continue
+        if name not in row.parameters:
+            return False
+        if name == "model" and not same_vendor:
+            left = canonical_model(value)
+            right = canonical_model(row.parameters[name])
+        else:
+            brand = vendor if same_vendor else ""
+            left = canonical_parameter(name, value, product.parameters.get("model", ""), brand)
+            right = canonical_parameter(name, row.parameters[name], row.parameters.get("model", ""), brand)
+        if left != right:
+            return False
+    akb = row.parameters.get("akb", "")
+    if akb and (not product.parameters.get("akb") or canonical_parameter("akb", product.parameters["akb"]) != canonical_parameter("akb", akb)):
+        return False
+    return True
+
+
 def matching_client_products(row: AutoloadRow, products: Sequence[Product]) -> List[Product]:
-    """Return source matches in price-sheet order; the script uses the first."""
-    return [product for product in products if product_matches(product, row)]
+    """Prefer the source script's match, then one unambiguous equivalent SKU."""
+    exact = [product for product in products if product_matches(product, row)]
+    if exact:
+        return exact
+    equivalent = [product for product in products if semantic_product_matches(product, row)]
+    return equivalent if len(equivalent) == 1 else []
 
 
 def is_used_item(row: AutoloadRow) -> bool:
@@ -1239,6 +1279,8 @@ class Monitor:
 
     def _find_issues(self, products: Sequence[Product], rows: Sequence[AutoloadRow], active: Dict[str, AvitoItem]) -> List[Issue]:
         issues: List[Issue] = []
+        unmatched_count = 0
+        unmatched_examples: List[str] = []
         monitored_rows = [row for row in rows if is_used_item(row)]
         # A client price can legitimately remain for an archived or unpublished
         # product. Only autoload rows confirmed active by Avito are checked.
@@ -1258,26 +1300,15 @@ class Monitor:
                 if reasons:
                     issues.append(Issue("%s:%s" % (product.key, item.item_id), product, row, item, tuple(reasons)))
             else:
-                match_category, match_note = classify_unmatched_client_row(row, products)
-                candidate_note = unmatched_client_note(row, products)
-                if candidate_note:
-                    match_note = candidate_note
-                autoload_product = Product(
-                    "autoload:%s" % item.item_id,
-                    "Автозагрузка",
-                    row.row,
-                    {"title": row.title or item.title},
-                    row.price if row.price is not None else item.price,
-                )
-                issues.append(Issue(
-                    "autoload:%s:missing-client-price" % item.item_id,
-                    autoload_product,
-                    row,
-                    item,
-                    ("Строка клиентской таблицы не сопоставлена",),
-                    match_note,
-                    match_category,
-                ))
+                # An unlinked row does not establish a price discrepancy.
+                # Keep a diagnostic in server logs instead of telling the
+                # client that a product or price is missing from their table.
+                unmatched_count += 1
+                if len(unmatched_examples) < 3:
+                    note = unmatched_client_note(row, products)
+                    unmatched_examples.append("%s:%s (Avito %s): %s" % (row.source_name, row.row, item.item_id, note))
+        if unmatched_count:
+            logging.warning("Skipped %s active listings without a confident client match; examples: %s", unmatched_count, " | ".join(unmatched_examples))
         return issues
 
     def _notify(self, issues: Sequence[Issue], force_notify: bool = False) -> Tuple[int, int]:
