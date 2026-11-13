@@ -1,8 +1,9 @@
 # Matching audit, 13 November 2026
 
 Evidence: the saved price-to-Avito run report supplied by the project owner, a
-copy of the KingStore Nizhnevartovsk client `Телефоны` tab, and the monitor's
-existing server logs. The source files and credentials are not stored in Git.
+copy of the KingStore Nizhnevartovsk client `Телефоны` tab, the monitor's
+existing server logs, and read-only checks of the linked client/autoload sheets.
+The source files and credentials are not stored in Git.
 No manual Avito API calls were made for this audit.
 
 | Confirmed case | Saved-report evidence | Monitor handling |
@@ -13,6 +14,7 @@ No manual Avito API calls were made for this audit.
 | Client row exists but has no current price | KingStore Nizhnevartovsk: 27 retained-price autoload rows concern Galaxy S25+, Z Flip7, and A56; their client rows have blank `Price`. The next routine monitor run also linked 46 SOTIKS Ivanovo active listings, including autoload row 559 to unpriced `Телефоны` 101, and 12 Kaluga Pixel 10 Pro listings to unpriced client rows. | Recognize the client row as unpriced and do not claim it is absent; still compare autoload with Avito |
 | Autoload and Avito prices differ while the client row cannot be priced | Independent values are available in both places | Report only the confirmed autoload-to-Avito discrepancy |
 | Avito list rate limit prevents a city's check | The routine run stopped at listing page 25/26 with HTTP 429 for Sachkoff Omsk, KingStore Nizhnevartovsk, and APPHUB Ekaterinburg. | Use `Retry-After` when supplied; otherwise wait a full minute before retrying the same page. Do not send a partial city's report. |
+| Client has only `Title` and `Price` for consoles | iHub Noyabrsk client `пс` rows 3–5 append `Гарантия` and/or `Рассрочка`; autoload `Avito - Игровые приставки` rows 3–5 omit them and have a `Model` column absent from the client sheet. | Compare complete titles after removing only those trailing sale terms and a spaced ` + ` delimiter; preserve `Дисковод` and model variants. This rule applies to every title-only sheet. |
 
 The routine run after the blank-price change identified 46 unpriced client
 matches in SOTIKS Ivanovo, 12 in Kaluga, 11 in Geek Choice Belgorod, six in
@@ -24,16 +26,21 @@ priced client row. An old autoload price therefore does not establish a current
 client price. The monitor must retain this distinction in its diagnostics.
 
 The Kaluga routine run also logged five iPhone 17 listings with two nearby
-client rows each, including autoload row 383 and client rows 152/157. The
-saved report shows a priced `SIM + eSIM` client row and a `Только eSIM`
-autoload row. These are left separate pending the owner's rule; no price is
-borrowed across explicitly different SIM variants.
+client rows each, including autoload row 383 and client rows 152/157. A
+read-only sheet check confirms that row 383 is `Только eSIM`, `256 ГБ`, white,
+while row 152 is `SIM + eSIM`, `256 ГБ`, white, and row 157 is `Только eSIM`,
+`512 ГБ`, white. Neither client row is the same SKU. The script can retain an
+older autoload price when a current client row is absent; the autoload price
+alone does not establish a current client match. Do not borrow a price across
+different SIM or capacity values.
+
+Geek Choice Belgorod autoload row 396 specifies `Не знаю` for SIM. Client
+rows 221 and 258 are both priced `iPhone 17 Pro`, `512 ГБ`, silver, but have
+different explicit SIM variants and different prices. Without a unique SKU
+there is no safe client-price comparison. A matching price is not a reliable
+identity key: it could hide precisely the stale-price error being monitored.
 
 The iHub Noyabrsk routine run reduced its unmatched active listings to three
-PlayStation rows. The saved report shows client titles with `Гарантия` and
-`Рассрочка`, while autoload titles omit those words. The source row columns
-are needed before defining a console title rule.
-
-Open evidence requests: the owner's rule for a blank client price; whether
-Kaluga's explicitly different SIM variants should remain distinct; and iHub
-Noyabrsk PlayStation client/autoload rows 3–5 with their column headers.
+PlayStation rows. The linked sheets confirm the exact client and autoload
+titles, so the title-only rule above addresses this pattern globally. No
+additional sheet copies are needed for the current matching changes.

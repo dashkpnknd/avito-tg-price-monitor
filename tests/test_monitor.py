@@ -18,6 +18,7 @@ from app.monitor import (
     extract_products,
     cell,
     classify_unmatched_client_row,
+    canonical_title,
     avito_json,
     fetch_active_avito_items,
     issue_example,
@@ -306,6 +307,52 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(1, len(issues))
         self.assertEqual(client, issues[0].product)
         self.assertEqual(("цена не дошла из клиентской таблицы в автозагрузку",), issues[0].reasons)
+
+    def test_title_only_console_rows_ignore_sale_terms_but_keep_disc_variant(self):
+        clients = [
+            Product("disc", "пс", 3, {"title": "Sony PlayStation 5 Slim + Дисковод Рассрочка"}, 76990),
+            Product("digital", "пс", 4, {"title": "Sony PlayStation 5 Slim Гарантия Рассрочка"}, 75990),
+            Product("pro", "пс", 5, {"title": "Sony PlayStation 5 Pro Гарантия Рассрочка"}, 135990),
+        ]
+        titles = ["Sony PlayStation 5 Slim Дисковод", "Sony PlayStation 5 Slim", "Sony PlayStation 5 Pro"]
+        for index, title in enumerate(titles):
+            with self.subTest(title=title):
+                row = AutoloadRow("Avito - Игровые приставки", index + 3, {
+                    "title": title, "model": "PlayStation 5 Slim" if index < 2 else "PlayStation 5 Pro",
+                }, [77990, 73990, 133990][index], str(index + 1), "")
+                self.assertEqual([clients[index]], matching_client_products(row, clients))
+        self.assertNotEqual(canonical_title(titles[0]), canonical_title(titles[1]))
+        self.assertEqual("galaxys25+", canonical_title("Galaxy S25+ Рассрочка"))
+
+    def test_saved_iphone_examples_do_not_merge_different_sim_or_capacity(self):
+        kaluga_clients = [
+            Product("sim", "Телефоны", 152, {
+                "model": "iPhone 17", "simconfig": "SIM + eSIM", "memorysize": "256 ГБ", "color": "белый",
+            }, 76490),
+            Product("capacity", "Телефоны", 157, {
+                "model": "iPhone 17", "simconfig": "Только eSIM", "memorysize": "512 ГБ", "color": "белый",
+            }, 88490),
+        ]
+        kaluga_row = AutoloadRow("Avito - Мобильные телефоны", 383, {
+            "model": "iPhone 17", "simconfig": "Только eSIM", "memorysize": "256 ГБ", "color": "белый",
+        }, 74990, "383", "")
+        self.assertEqual([], matching_client_products(kaluga_row, kaluga_clients))
+
+        belgorod_clients = [
+            Product("esim", "телефоны", 221, {
+                "vendor": "Apple", "model": "iPhone 17 Pro", "simconfig": "Только eSIM",
+                "memorysize": "512 ГБ", "color": "серебристый", "ramsize": "12 ГБ",
+            }, 112900),
+            Product("sim", "телефоны", 258, {
+                "vendor": "Apple", "model": "iPhone 17 Pro", "simconfig": "SIM + eSIM",
+                "memorysize": "512 ГБ", "color": "серебристый", "ramsize": "12 ГБ",
+            }, 123900),
+        ]
+        belgorod_row = AutoloadRow("Avito - Мобильные телефоны", 396, {
+            "vendor": "Apple", "model": "iPhone 17 Pro", "simconfig": "Не знаю",
+            "memorysize": "512 ГБ", "color": "серебристый", "ramsize": "12 ГБ",
+        }, 123900, "396", "")
+        self.assertEqual([], matching_client_products(belgorod_row, belgorod_clients))
 
     def test_saved_kingstore_s25_plus_row_exists_with_blank_client_price(self):
         rows = [

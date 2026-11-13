@@ -620,6 +620,14 @@ def canonical_color(value: object, model: object = "") -> str:
     return phone_color(str(value or ""), str(model or ""))
 
 
+def canonical_title(value: object) -> str:
+    """Remove trailing sale terms, preserving model markers such as S25+."""
+    title = str(value or "").strip()
+    title = re.sub(r"(?:\s+(?:гарантия|рассрочка))+\s*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+\+\s+", " ", title)
+    return normalized(title)
+
+
 def canonical_parameter(name: str, value: object, model: object = "", vendor: object = "") -> str:
     if name == "model":
         return canonical_model(value, vendor)
@@ -629,6 +637,8 @@ def canonical_parameter(name: str, value: object, model: object = "", vendor: ob
         return canonical_sim(value)
     if name == "color":
         return canonical_color(value, model)
+    if name == "title":
+        return canonical_title(value)
     return normalized(value)
 
 
@@ -892,7 +902,10 @@ def semantic_product_matches(product: Product, row: AutoloadRow, allow_unknown_s
     row_vendor = row.parameters.get("vendor", "")
     same_vendor = bool(vendor and row_vendor and normalized(vendor) == normalized(row_vendor))
     if not product.parameters.get("model") or not row.parameters.get("model"):
-        return False
+        # Title/Price layouts (consoles, watches, accessories) have no Model
+        # column.  Both sides must then supply a title to compare.
+        if not product.parameters.get("title") or not row.parameters.get("title"):
+            return False
     for name, value in product.parameters.items():
         if name.startswith("_") or name in CLIENT_METADATA_FIELDS:
             continue
