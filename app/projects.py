@@ -46,9 +46,10 @@ def config_for_project(base: Config, project: Dict[str, object]) -> Config:
         client_id = str(project["avito_client_id"]).strip()
         client_secret = str(project["avito_client_secret"]).strip()
         delay_hours = int(project.get("delay_hours", 5))
+        repeat_hours = int(project.get("notification_repeat_hours", base.notification_repeat.total_seconds() / 3600))
     except (KeyError, TypeError, ValueError) as error:
         raise MonitorError("Project registry contains an invalid project") from error
-    if not all((name, client_sheet, autoload_sheet, client_id, client_secret)) or delay_hours <= 0:
+    if not all((name, client_sheet, autoload_sheet, client_id, client_secret)) or delay_hours <= 0 or repeat_hours <= 0:
         raise MonitorError("Project registry contains an incomplete project")
     identifier = str(project.get("id") or project_id(name, client_sheet))
     client_tab_names = project.get("client_tab_names")
@@ -78,6 +79,7 @@ def config_for_project(base: Config, project: Dict[str, object]) -> Config:
         avito_client_secret=client_secret,
         state_path=base.state_path.parent / ("state-%s.json" % identifier),
         mismatch_grace=timedelta(hours=delay_hours),
+        notification_repeat=timedelta(hours=repeat_hours),
     )
 
 
