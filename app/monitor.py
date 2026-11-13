@@ -205,7 +205,7 @@ class Issue:
     match_category: str = "price_mismatch"
 
     def message(self, elapsed: timedelta) -> str:
-        expected = format_price(self.product.price)
+        expected = format_price(self.product.price) if self.product.price is not None else "нет текущей цены"
         autoload_price = format_price(self.autoload.price if self.autoload else None)
         avito_price = format_price(self.avito.price if self.avito else None)
         title = self.product.title or format_parameters(self.product.parameters)
@@ -932,7 +932,8 @@ def matching_client_products(row: AutoloadRow, products: Sequence[Product]) -> L
 
     exact = [product for product in products if product_matches(product, row)]
     if exact:
-        return exact
+        priced_exact = [product for product in exact if product.price is not None]
+        return priced_exact or exact
     equivalent = [product for product in products if semantic_product_matches(product, row)]
     if equivalent:
         return one_price_for_same_sku(equivalent)
@@ -1141,7 +1142,7 @@ def issue_example(issue: Issue) -> str:
             lines.append("🏷 <b>%s</b>" % html.escape(MATCH_CATEGORY_LABELS.get(issue.match_category, issue.match_category)))
     else:
         lines.extend((
-            "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price)),
+            "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price) if issue.product.price is not None else "нет текущей цены"),
             "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
             "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
         ))
@@ -1303,8 +1304,6 @@ class Monitor:
         unmatched_examples: List[str] = []
         unpriced_count = 0
         unpriced_examples: List[str] = []
-        priced_products = [product for product in products if product.price is not None]
-        unpriced_products = [product for product in products if product.price is None]
         monitored_rows = [row for row in rows if is_used_item(row)]
         # A client price can legitimately remain for an archived or unpublished
         # product. Only autoload rows confirmed active by Avito are checked.
@@ -1313,16 +1312,22 @@ class Monitor:
             row = active_autoload.get(item.item_id)
             if row is None:
                 continue
-            matches = matching_client_products(row, priced_products)
+            matches = matching_client_products(row, products)
             if matches:
                 product = matches[0]
                 reasons: List[str] = []
-                if row.price != product.price:
+                if product.price is not None and row.price != product.price:
                     reasons.append("цена не дошла из клиентской таблицы в автозагрузку")
                 if row.price != item.price:
                     reasons.append("цена не дошла из автозагрузки в Авито")
                 if reasons:
                     issues.append(Issue("%s:%s" % (product.key, item.item_id), product, row, item, tuple(reasons)))
+                if product.price is None:
+                    unpriced_count += 1
+                    if len(unpriced_examples) < 3:
+                        unpriced_examples.append("%s:%s (Avito %s) -> %s:%s" % (
+                            row.source_name, row.row, item.item_id, product.source_name, product.row,
+                        ))
             else:
                 # A missing client link cannot establish a client-price gap,
                 # but the autoload and Avito prices can still be compared.
@@ -1341,19 +1346,10 @@ class Monitor:
                         item,
                         ("цена не дошла из автозагрузки в Авито",),
                     ))
-                blank_matches = matching_client_products(row, unpriced_products)
-                if blank_matches:
-                    unpriced_count += 1
-                    if len(unpriced_examples) < 3:
-                        product = blank_matches[0]
-                        unpriced_examples.append("%s:%s (Avito %s) -> %s:%s" % (
-                            row.source_name, row.row, item.item_id, product.source_name, product.row,
-                        ))
-                else:
-                    unmatched_count += 1
-                    if len(unmatched_examples) < 3:
-                        note = unmatched_client_note(row, products)
-                        unmatched_examples.append("%s:%s (Avito %s): %s" % (row.source_name, row.row, item.item_id, note))
+                unmatched_count += 1
+                if len(unmatched_examples) < 3:
+                    note = unmatched_client_note(row, products)
+                    unmatched_examples.append("%s:%s (Avito %s): %s" % (row.source_name, row.row, item.item_id, note))
         if unpriced_count:
             logging.info("Found %s active listings with a client row but no client price; examples: %s", unpriced_count, " | ".join(unpriced_examples))
         if unmatched_count:

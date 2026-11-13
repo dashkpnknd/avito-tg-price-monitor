@@ -328,7 +328,23 @@ class MatchingTests(unittest.TestCase):
         with self.assertLogs(level="INFO"):
             issues = Monitor(None)._find_issues(client, [row], {"123": AvitoItem("123", "Galaxy S25+", 71990, "active", "")})
         self.assertEqual(("цена не дошла из автозагрузки в Авито",), issues[0].reasons)
-        self.assertIn("Клиентская цена: <b>не проверена</b>", issue_example(issues[0]))
+        self.assertEqual(client[0], issues[0].product)
+        self.assertIn("Клиент: <b>нет текущей цены</b>", issue_example(issues[0]))
+
+    def test_exact_blank_client_row_beats_fuzzy_priced_sim_candidate(self):
+        exact_blank = Product("blank", "Телефоны", 10, {
+            "model": "iPhone 17", "memorysize": "256 ГБ", "color": "белый", "simconfig": "Только eSIM"
+        }, None)
+        fuzzy_priced = Product("priced", "Телефоны", 11, {
+            "model": "iPhone 17", "memorysize": "256 ГБ", "color": "белый", "simconfig": "Не знаю"
+        }, 75990)
+        row = AutoloadRow("Автозагрузка", 383, exact_blank.parameters, 74990, "123", "")
+        self.assertEqual([exact_blank], matching_client_products(row, [fuzzy_priced, exact_blank]))
+        with self.assertLogs(level="INFO"):
+            issues = Monitor(None)._find_issues([fuzzy_priced, exact_blank], [row], {
+                "123": AvitoItem("123", "iPhone 17", 74990, "active", "")
+            })
+        self.assertEqual([], issues)
 
     def test_unknown_sim_does_not_override_an_exact_variant_or_merge_two_known_variants(self):
         unknown = Product("unknown", "телефоны", 10, {"model": "Pixel 10", "memorysize": "256 ГБ", "color": "синий", "simconfig": "Не знаю"}, 73990)
