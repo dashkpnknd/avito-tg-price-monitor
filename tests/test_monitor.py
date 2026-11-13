@@ -278,6 +278,68 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual([], issues)
         self.assertIn("without a confident client match", logs.output[0])
 
+    def test_duplicate_equivalent_rows_with_the_same_price_use_first_row(self):
+        products = [
+            Product("first", "Телефоны", 42, {"model": "17 Ultra", "memorysize": "1024 ГБ", "color": "белый"}, 123990),
+            Product("second", "Телефоны", 43, {"model": "17 Ultra", "memorysize": "1024 GB", "color": "белый"}, 123990),
+        ]
+        row = AutoloadRow("Автозагрузка", 100, {"model": "17 Ultra", "memorysize": "1 ТБ", "color": "белый"}, 123990, "123", "")
+        self.assertEqual([products[0]], matching_client_products(row, products))
+
+    def test_saved_ihub_report_links_unknown_client_sim_to_one_listing(self):
+        # 13 Nov log: iHub iPhone 16 Plus R148 says "Нет в Авито" while
+        # autoload R323 retains a price and says "Нет в прайсе".
+        client = Product("ihub-148", "телефоны", 148, {
+            "model": "iPhone 16 Plus", "memorysize": "128 ГБ", "color": "голубой",
+            "simconfig": "Не знаю", "ramsize": "8 ГБ",
+        }, 76990)
+        row = AutoloadRow("Avito - Мобильные телефоны", 323, {
+            "model": "iPhone 16 Plus", "memorysize": "128 ГБ", "color": "голубой",
+            "simconfig": "SIM + eSIM", "ramsize": "8 ГБ",
+        }, 78990, "8577523182", "")
+        self.assertFalse(product_matches(client, row))
+        self.assertEqual([client], matching_client_products(row, [client]))
+        issues = Monitor(None)._find_issues([client], [row], {
+            row.ad_id: AvitoItem(row.ad_id, "iPhone 16 Plus", 78990, "active", "")
+        })
+        self.assertEqual(1, len(issues))
+        self.assertEqual(client, issues[0].product)
+        self.assertEqual(("цена не дошла из клиентской таблицы в автозагрузку",), issues[0].reasons)
+
+    def test_saved_kingstore_s25_plus_row_exists_with_blank_client_price(self):
+        rows = [
+            ["Vendor", "Model", "SimConfig", "Color", "MemorySize", "RamSize", "Price"],
+            ["Samsung", "Galaxy S25+", "SIM + eSIM", "синий", "256 ГБ", "12 ГБ", ""],
+        ]
+        source = SheetSource("Телефоны", "id", "gid")
+        self.assertEqual([], extract_products(source, rows))
+        client = extract_products(source, rows, include_unpriced=True)
+        self.assertEqual(1, len(client))
+        self.assertIsNone(client[0].price)
+        row = AutoloadRow("Avito - Мобильные телефоны", 472, {
+            "vendor": "Samsung", "model": "Galaxy S25+", "simconfig": "SIM + eSIM",
+            "color": "синий", "memorysize": "256 ГБ", "ramsize": "12 ГБ",
+        }, 70990, "123", "")
+        with self.assertLogs(level="INFO") as logs:
+            issues = Monitor(None)._find_issues(client, [row], {"123": AvitoItem("123", "Galaxy S25+", 70990, "active", "")})
+        self.assertEqual([], issues)
+        self.assertTrue(any("client row but no client price" in line for line in logs.output))
+        self.assertTrue(any("Телефоны:2" in line for line in logs.output))
+        with self.assertLogs(level="INFO"):
+            issues = Monitor(None)._find_issues(client, [row], {"123": AvitoItem("123", "Galaxy S25+", 71990, "active", "")})
+        self.assertEqual(("цена не дошла из автозагрузки в Авито",), issues[0].reasons)
+        self.assertIn("Клиентская цена: <b>не проверена</b>", issue_example(issues[0]))
+
+    def test_unknown_sim_does_not_override_an_exact_variant_or_merge_two_known_variants(self):
+        unknown = Product("unknown", "телефоны", 10, {"model": "Pixel 10", "memorysize": "256 ГБ", "color": "синий", "simconfig": "Не знаю"}, 73990)
+        exact = Product("exact", "телефоны", 11, {"model": "Pixel 10", "memorysize": "256 ГБ", "color": "синий", "simconfig": "SIM + eSIM"}, 74990)
+        row = AutoloadRow("Avito", 30, {"model": "Pixel 10", "memorysize": "256 ГБ", "color": "синий", "simconfig": "SIM + eSIM"}, 74990, "123", "")
+        self.assertEqual([exact], matching_client_products(row, [unknown, exact]))
+        different = AutoloadRow(row.source_name, row.row, {**row.parameters, "simconfig": "Только eSIM"}, row.price, row.ad_id, row.url)
+        self.assertEqual([unknown], matching_client_products(different, [unknown, exact]))
+        ambiguous = Product("unknown2", "телефоны", 12, unknown.parameters, 72990)
+        self.assertEqual([], matching_client_products(different, [unknown, exact, ambiguous]))
+
     def test_numeric_sheet_cells_match_apps_script_display_form(self):
         self.assertEqual("400", cell([400.0], 0))
 
@@ -369,7 +431,7 @@ class MatchingTests(unittest.TestCase):
                 items = fetch_active_avito_items(config)
         self.assertEqual(["1"], list(items))
 
-    def test_explains_that_an_unmatched_client_row_is_not_a_missing_price(self):
+    def test_unlinked_client_row_does_not_claim_the_product_is_missing(self):
         autoload = AutoloadRow(
             "Avito", 2,
             {"title": "iPhone 17 Pro Max, 1 ТБ", "color": "серебристый", "simconfig": "Только eSIM"},
@@ -381,7 +443,8 @@ class MatchingTests(unittest.TestCase):
             ("Нет соответствующей цены в клиентской таблице",),
         )
         card = issue_example(issue)
-        self.assertIn("подходящая строка не сопоставлена", card)
+        self.assertIn("Клиентская цена: <b>не проверена</b>", card)
+        self.assertNotIn("подходящая строка не сопоставлена", card)
         self.assertIn("Цвет: <b>серебристый</b>", card)
         self.assertIn("SIM: <b>Только eSIM</b>", card)
 
@@ -394,6 +457,19 @@ class MatchingTests(unittest.TestCase):
             "Возможный кандидат: лист «Телефоны», строка 42. Отличается: SIM.",
         )
         self.assertIn("Возможный кандидат", issue_example(issue))
+
+    def test_unlinked_client_still_checks_autoload_price_against_avito(self):
+        row = AutoloadRow("Avito - Мобильные телефоны", 777, {
+            "model": "Pixel 10 Pro", "memorysize": "128 ГБ", "color": "бежевый"
+        }, 79990, "123", "")
+        active = {"123": AvitoItem("123", "Pixel 10 Pro", 81990, "active", "")}
+        with self.assertLogs(level="WARNING"):
+            issues = Monitor(None)._find_issues([], [row], active)
+        self.assertEqual(1, len(issues))
+        self.assertEqual(("цена не дошла из автозагрузки в Авито",), issues[0].reasons)
+        self.assertIn("Автозагрузка: <b>79 990", issue_example(issues[0]))
+        self.assertIn("Авито: <b>81 990", issue_example(issues[0]))
+        self.assertNotIn("подходящая строка не сопоставлена", issue_example(issues[0]))
 
     def test_keeps_phone_title_for_a_readable_digest_without_matching_on_it(self):
         rows = [["НОВЫЙ", "Lime Store Наличка"], ["iPhone 16E 128Gb black", "57 990"]]

@@ -164,7 +164,7 @@ class Product:
     source_name: str
     row: int
     parameters: Dict[str, str]
-    price: int
+    price: Optional[int]
 
     @property
     def title(self) -> str:
@@ -441,9 +441,9 @@ def product_key(source: str, row: int, parameters: Dict[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
-def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List[Product]:
+def extract_products(source: SheetSource, rows: Sequence[Sequence[str]], include_unpriced: bool = False) -> List[Product]:
     if source.kind == "phone_cash":
-        return extract_phone_cash_products(source, rows)
+        return extract_phone_cash_products(source, rows, include_unpriced=include_unpriced)
     if source.kind != "strict_price":
         raise MonitorError("Unsupported client sheet kind %s for %s" % (source.kind, source.name))
     header_row = find_header_row(rows)
@@ -463,7 +463,7 @@ def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List
         ]
         for row_number, row in enumerate(rows[header_row + 1 :], start=header_row + 2):
             price = parse_price(cell(row, price_column))
-            if price is None:
+            if price is None and not include_unpriced:
                 continue
             parameters = {name: cell(row, index) for index, name in fields}
             if not any(parameters.values()):
@@ -472,14 +472,14 @@ def extract_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List
     return products
 
 
-def fetch_avito_template_products(spreadsheet_id: str) -> List[Product]:
+def fetch_avito_template_products(spreadsheet_id: str, include_unpriced: bool = False) -> List[Product]:
     """Return every client product from tabs explicitly marked '(авито)'."""
     payload = http_bytes(GOOGLE_XLSX_EXPORT.format(sheet_id=spreadsheet_id))
     products: List[Product] = []
     for name, rows in parse_xlsx_workbook(payload):
         if "(авито)" not in name.lower():
             continue
-        products.extend(extract_products(SheetSource(name, spreadsheet_id, name), rows))
+        products.extend(extract_products(SheetSource(name, spreadsheet_id, name), rows, include_unpriced=include_unpriced))
     return products
 
 
@@ -488,7 +488,7 @@ def named_tab_source(source: SheetSource) -> bool:
     return source.gid.startswith("tab:")
 
 
-def fetch_named_client_products(sources: Sequence[SheetSource]) -> List[Product]:
+def fetch_named_client_products(sources: Sequence[SheetSource], include_unpriced: bool = False) -> List[Product]:
     by_workbook: Dict[str, List[SheetSource]] = {}
     for source in sources:
         by_workbook.setdefault(source.spreadsheet_id, []).append(source)
@@ -500,7 +500,7 @@ def fetch_named_client_products(sources: Sequence[SheetSource]) -> List[Product]
             values = tabs.get(tab_name.casefold())
             if values is None:
                 raise MonitorError("Configured client tab was not found: %s" % tab_name)
-            products.extend(extract_products(source, values))
+            products.extend(extract_products(source, values, include_unpriced=include_unpriced))
     return products
 
 
@@ -771,7 +771,7 @@ def find_column(headers: Sequence[str], requested: str) -> Optional[int]:
     return next((index for index, header in enumerate(headers) if normalized(header) == wanted), None)
 
 
-def extract_phone_cash_products(source: SheetSource, rows: Sequence[Sequence[str]]) -> List[Product]:
+def extract_phone_cash_products(source: SheetSource, rows: Sequence[Sequence[str]], include_unpriced: bool = False) -> List[Product]:
     if not rows:
         return []
     headers = rows[0]
@@ -784,7 +784,7 @@ def extract_phone_cash_products(source: SheetSource, rows: Sequence[Sequence[str
         title = cell(row, title_column)
         price = parse_price(cell(row, price_column))
         parameters = parse_phone_title(title)
-        if price is None or parameters is None:
+        if parameters is None or (price is None and not include_unpriced):
             continue
         # Store the compact client title only for readable notifications.  It
         # must not participate in the strict match against Avito's own title.
@@ -879,7 +879,7 @@ def product_matches(product: Product, row: AutoloadRow) -> bool:
     return True
 
 
-def semantic_product_matches(product: Product, row: AutoloadRow) -> bool:
+def semantic_product_matches(product: Product, row: AutoloadRow, allow_unknown_sim: bool = False) -> bool:
     """Match equivalent SKU values when the source script's text differs.
 
     Every client field must still be present, and a non-empty Avito AKB must
@@ -896,6 +896,8 @@ def semantic_product_matches(product: Product, row: AutoloadRow) -> bool:
             continue
         if name not in row.parameters:
             return False
+        if name == "simconfig" and allow_unknown_sim and (is_unknown(value) or is_unknown(row.parameters[name])):
+            continue
         if name == "model" and not same_vendor:
             left = canonical_model(value)
             right = canonical_model(row.parameters[name])
@@ -912,12 +914,30 @@ def semantic_product_matches(product: Product, row: AutoloadRow) -> bool:
 
 
 def matching_client_products(row: AutoloadRow, products: Sequence[Product]) -> List[Product]:
-    """Prefer the source script's match, then one unambiguous equivalent SKU."""
+    """Prefer the source script, then equivalent values, then unknown SIM."""
+    def one_price_for_same_sku(candidates: List[Product]) -> List[Product]:
+        if len(candidates) <= 1:
+            return candidates
+        first = candidates[0]
+        def signature(product: Product) -> Tuple[Tuple[str, str], ...]:
+            return tuple(sorted(
+                (name, canonical_parameter(name, value, product.parameters.get("model", ""), product.parameters.get("vendor", "")))
+                for name, value in product.parameters.items()
+                if not name.startswith("_") and name not in CLIENT_METADATA_FIELDS
+            ))
+        first_signature = signature(first)
+        if all(candidate.price == first.price and signature(candidate) == first_signature for candidate in candidates[1:]):
+            return [first]
+        return []
+
     exact = [product for product in products if product_matches(product, row)]
     if exact:
         return exact
     equivalent = [product for product in products if semantic_product_matches(product, row)]
-    return equivalent if len(equivalent) == 1 else []
+    if equivalent:
+        return one_price_for_same_sku(equivalent)
+    unknown_sim = [product for product in products if semantic_product_matches(product, row, allow_unknown_sim=True)]
+    return one_price_for_same_sku(unknown_sim)
 
 
 def is_used_item(row: AutoloadRow) -> bool:
@@ -1111,7 +1131,7 @@ def issue_example(issue: Issue) -> str:
         if sim_config:
             lines.append("📱 SIM: <b>%s</b>" % html.escape(sim_config))
         lines.extend((
-            "👤 Клиентская таблица: <b>подходящая строка не сопоставлена</b>",
+            "👤 Клиентская цена: <b>не проверена</b>",
             "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
             "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
         ))
@@ -1260,11 +1280,11 @@ class Monitor:
     def run_once(self, force_notify: bool = False) -> RunSummary:
         named_client_sources = [source for source in self.config.client_sources if named_tab_source(source)]
         if named_client_sources:
-            client = fetch_named_client_products(named_client_sources)
+            client = fetch_named_client_products(named_client_sources, include_unpriced=True)
         else:
             client = []
             for spreadsheet_id in self.config.client_spreadsheet_ids:
-                client.extend(fetch_avito_template_products(spreadsheet_id))
+                client.extend(fetch_avito_template_products(spreadsheet_id, include_unpriced=True))
         named_autoload_sources = [source for source in self.config.autoload_sources if named_tab_source(source)]
         if named_autoload_sources:
             autoload = fetch_named_autoload_rows(named_autoload_sources)
@@ -1275,12 +1295,16 @@ class Monitor:
         active = fetch_active_avito_items(self.config)
         issues = self._find_issues(client, autoload, active)
         alerts, resolved = self._notify(issues, force_notify=force_notify)
-        return RunSummary(len(client), len(autoload), len(active), len(issues), alerts, resolved)
+        return RunSummary(sum(product.price is not None for product in client), len(autoload), len(active), len(issues), alerts, resolved)
 
     def _find_issues(self, products: Sequence[Product], rows: Sequence[AutoloadRow], active: Dict[str, AvitoItem]) -> List[Issue]:
         issues: List[Issue] = []
         unmatched_count = 0
         unmatched_examples: List[str] = []
+        unpriced_count = 0
+        unpriced_examples: List[str] = []
+        priced_products = [product for product in products if product.price is not None]
+        unpriced_products = [product for product in products if product.price is None]
         monitored_rows = [row for row in rows if is_used_item(row)]
         # A client price can legitimately remain for an archived or unpublished
         # product. Only autoload rows confirmed active by Avito are checked.
@@ -1289,7 +1313,7 @@ class Monitor:
             row = active_autoload.get(item.item_id)
             if row is None:
                 continue
-            matches = matching_client_products(row, products)
+            matches = matching_client_products(row, priced_products)
             if matches:
                 product = matches[0]
                 reasons: List[str] = []
@@ -1300,13 +1324,38 @@ class Monitor:
                 if reasons:
                     issues.append(Issue("%s:%s" % (product.key, item.item_id), product, row, item, tuple(reasons)))
             else:
-                # An unlinked row does not establish a price discrepancy.
-                # Keep a diagnostic in server logs instead of telling the
-                # client that a product or price is missing from their table.
-                unmatched_count += 1
-                if len(unmatched_examples) < 3:
-                    note = unmatched_client_note(row, products)
-                    unmatched_examples.append("%s:%s (Avito %s): %s" % (row.source_name, row.row, item.item_id, note))
+                # A missing client link cannot establish a client-price gap,
+                # but the autoload and Avito prices can still be compared.
+                if row.price is not None and row.price != item.price:
+                    autoload_product = Product(
+                        "autoload:%s" % item.item_id,
+                        "Автозагрузка",
+                        row.row,
+                        {"title": row.title or item.title},
+                        row.price,
+                    )
+                    issues.append(Issue(
+                        "autoload:%s:avito-price" % item.item_id,
+                        autoload_product,
+                        row,
+                        item,
+                        ("цена не дошла из автозагрузки в Авито",),
+                    ))
+                blank_matches = matching_client_products(row, unpriced_products)
+                if blank_matches:
+                    unpriced_count += 1
+                    if len(unpriced_examples) < 3:
+                        product = blank_matches[0]
+                        unpriced_examples.append("%s:%s (Avito %s) -> %s:%s" % (
+                            row.source_name, row.row, item.item_id, product.source_name, product.row,
+                        ))
+                else:
+                    unmatched_count += 1
+                    if len(unmatched_examples) < 3:
+                        note = unmatched_client_note(row, products)
+                        unmatched_examples.append("%s:%s (Avito %s): %s" % (row.source_name, row.row, item.item_id, note))
+        if unpriced_count:
+            logging.info("Found %s active listings with a client row but no client price; examples: %s", unpriced_count, " | ".join(unpriced_examples))
         if unmatched_count:
             logging.warning("Skipped %s active listings without a confident client match; examples: %s", unmatched_count, " | ".join(unmatched_examples))
         return issues
