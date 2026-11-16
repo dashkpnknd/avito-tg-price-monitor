@@ -959,6 +959,20 @@ def matching_client_products(row: AutoloadRow, products: Sequence[Product]) -> L
     if equivalent:
         return one_price_for_same_sku(equivalent)
     unknown_sim = [product for product in products if semantic_product_matches(product, row, allow_unknown_sim=True)]
+    if is_unknown(row.parameters.get("simconfig", "")) and len(unknown_sim) > 1:
+        # The owner uses the lowest current price when the autoload SIM is
+        # unknown. Apply that policy only when every other client SKU field is
+        # identical; a different capacity/color/model must never join the set.
+        def without_sim(product: Product) -> Tuple[Tuple[str, str], ...]:
+            return tuple(sorted(
+                (name, canonical_parameter(name, value, product.parameters.get("model", ""), product.parameters.get("vendor", "")))
+                for name, value in product.parameters.items()
+                if name != "simconfig" and not name.startswith("_") and name not in CLIENT_METADATA_FIELDS
+            ))
+        if len({without_sim(product) for product in unknown_sim}) == 1:
+            priced = [product for product in unknown_sim if product.price is not None]
+            if priced:
+                return [min(priced, key=lambda product: product.price)]
     return one_price_for_same_sku(unknown_sim)
 
 

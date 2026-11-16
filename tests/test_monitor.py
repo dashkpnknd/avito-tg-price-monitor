@@ -350,7 +350,7 @@ class MatchingTests(unittest.TestCase):
         self.assertNotEqual(canonical_title(titles[0]), canonical_title(titles[1]))
         self.assertEqual("galaxys25+", canonical_title("Galaxy S25+ Рассрочка"))
 
-    def test_saved_iphone_examples_do_not_merge_different_sim_or_capacity(self):
+    def test_saved_iphone_examples_keep_capacity_distinct_and_use_lowest_unknown_sim_price(self):
         kaluga_clients = [
             Product("sim", "Телефоны", 152, {
                 "model": "iPhone 17", "simconfig": "SIM + eSIM", "memorysize": "256 ГБ", "color": "белый",
@@ -378,7 +378,22 @@ class MatchingTests(unittest.TestCase):
             "vendor": "Apple", "model": "iPhone 17 Pro", "simconfig": "Не знаю",
             "memorysize": "512 ГБ", "color": "серебристый", "ramsize": "12 ГБ",
         }, 123900, "396", "")
-        self.assertEqual([], matching_client_products(belgorod_row, belgorod_clients))
+        self.assertEqual([belgorod_clients[0]], matching_client_products(belgorod_row, belgorod_clients))
+        issues = Monitor(None)._find_issues(belgorod_clients, [belgorod_row], {
+            "396": AvitoItem("396", "iPhone 17 Pro", 123900, "active", "")
+        })
+        self.assertEqual(1, len(issues))
+        self.assertEqual(("цена не дошла из клиентской таблицы в автозагрузку",), issues[0].reasons)
+
+    def test_unknown_sim_lowest_price_requires_same_other_sku_fields(self):
+        candidates = [
+            Product("small", "Телефоны", 1, {"model": "Pixel 10", "memorysize": "128 ГБ", "simconfig": "SIM + eSIM"}, 40000),
+            Product("large", "Телефоны", 2, {"model": "Pixel 10", "memorysize": "256 ГБ", "simconfig": "Только eSIM"}, 50000),
+        ]
+        row = AutoloadRow("Avito", 3, {"model": "Pixel 10", "memorysize": "256 ГБ", "simconfig": "Не знаю"}, 50000, "3", "")
+        self.assertEqual([candidates[1]], matching_client_products(row, candidates))
+        row = AutoloadRow("Avito", 4, {"model": "Pixel 10", "memorysize": "512 ГБ", "simconfig": "Не знаю"}, 50000, "4", "")
+        self.assertEqual([], matching_client_products(row, candidates))
 
     def test_saved_kingstore_s25_plus_row_exists_with_blank_client_price(self):
         rows = [

@@ -11,6 +11,7 @@ No manual Avito API calls were made for this audit.
 | Technical `Причина без цены` column blocked Android rows | Pixel 10 was matched by the price script but rejected by the monitor's older parser | Exclude the same technical columns as the source script |
 | Storage units differ | KingStore Nizhnevartovsk: 12 Xiaomi 17 Ultra autoload rows show `1 ТБ`, while the four priced client rows show `1024 ГБ`; Kaluga has eight analogous Pixel 11 rows | Match equivalent capacities after the exact script match |
 | Client SIM is unknown | iHub Noyabrsk: 29 retained-price autoload rows have a corresponding priced client row with `Не знаю` versus a specified SIM | Use the unique row whose other SKU fields agree; keep two different specified SIM variants distinct |
+| Autoload SIM is unknown with multiple priced client variants | Geek Choice Belgorod autoload row 396 has `Не знаю`; client rows 221 and 258 differ only by explicit SIM and price. On 16 November, the owner specified the global policy: use the lowest current client price. | Select the lowest priced candidate only when all other SKU fields agree. This is a monitor policy, not a rule in the supplied source script. |
 | Client row exists but has no current price | KingStore Nizhnevartovsk: 27 retained-price autoload rows concern Galaxy S25+, Z Flip7, and A56; their client rows have blank `Price`. The next routine monitor run also linked 46 SOTIKS Ivanovo active listings, including autoload row 559 to unpriced `Телефоны` 101, and 12 Kaluga Pixel 10 Pro listings to unpriced client rows. | Recognize the client row as unpriced and do not claim it is absent; still compare autoload with Avito |
 | Autoload and Avito prices differ while the client row cannot be priced | Independent values are available in both places | Report only the confirmed autoload-to-Avito discrepancy |
 | Avito list rate limit prevents a city's check | The routine run stopped at listing page 25/26 with HTTP 429 for Sachkoff Omsk, KingStore Nizhnevartovsk, and APPHUB Ekaterinburg. | Use `Retry-After` when supplied; otherwise wait a full minute before retrying the same page. Do not send a partial city's report. |
@@ -37,9 +38,9 @@ different SIM or capacity values.
 
 Geek Choice Belgorod autoload row 396 specifies `Не знаю` for SIM. Client
 rows 221 and 258 are both priced `iPhone 17 Pro`, `512 ГБ`, silver, but have
-different explicit SIM variants and different prices. Without a unique SKU
-there is no safe client-price comparison. A matching price is not a reliable
-identity key: it could hide precisely the stale-price error being monitored.
+different explicit SIM variants and different prices. The owner supplied the
+lowest-price policy for this case. The monitor uses it for price comparison
+without treating the old autoload price as a product identity key.
 
 The iHub Noyabrsk routine run reduced its unmatched active listings to three
 PlayStation rows. The linked sheets confirm the exact client and autoload
