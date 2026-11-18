@@ -534,6 +534,18 @@ class MatchingTests(unittest.TestCase):
         self.assertNotIn("Открыть объявление", message)
         self.assertNotIn("Vendor:", message)
 
+    def test_noyabrsk_unpriced_listing_is_not_a_price_mismatch(self):
+        description = "Samsung Galaxy S25 Ultra, 512 ГБ\n\n✨Нoвый\n💯Оригинальный\nКод поставки: k-8677"
+        product = Product("s25", "телефоны", 12, {"title": description}, None)
+        row = AutoloadRow("Avito - Мобильные телефоны", 15, {"title": description}, None, "123", "")
+        avito = AvitoItem("123", "Samsung Galaxy S25 Ultra, 512 ГБ", 83990, "active", "")
+        self.assertEqual([], Monitor(None)._find_issues([product], [row], {"123": avito}))
+        old_card = Issue("s25:123", product, row, avito, ("цена не дошла из автозагрузки в Авито",))
+        card = issue_example(old_card)
+        self.assertIn("Samsung Galaxy S25 Ultra, 512 ГБ", card)
+        self.assertNotIn("Оригинальный", card)
+        self.assertNotIn("Код поставки", card)
+
     def test_clean_result_sends_and_refreshes_morning_status(self):
         with TemporaryDirectory() as directory:
             monitor = Monitor(self.notification_config(directory))

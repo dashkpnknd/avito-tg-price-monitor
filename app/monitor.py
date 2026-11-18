@@ -1163,6 +1163,9 @@ def issue_example(issue: Issue) -> str:
             vendor = ""
         parts = [vendor, model] + [parameters.get(name, "") for name in ("simconfig", "color", "memorysize", "ramsize")]
         title = " ".join(part for part in parts if part) or (issue.avito.title if issue.avito else "")
+    # Some source Title cells contain the whole ad text after the product name.
+    # The first non-empty line is the concise listing title.
+    title = next((line.strip() for line in html.unescape(title).splitlines() if line.strip()), "Товар")
     lines = ["<b>%s</b>" % html.escape(title)]
     client_price = format_price(issue.product.price) if issue.product.source_name not in {"Автозагрузка", "Авито"} else "не проверена"
     lines.extend((
@@ -1316,7 +1319,7 @@ class Monitor:
                 reasons: List[str] = []
                 if product.price is not None and row.price != product.price:
                     reasons.append("цена не дошла из клиентской таблицы в автозагрузку")
-                if row.price != item.price:
+                if row.price is not None and row.price != item.price:
                     reasons.append("цена не дошла из автозагрузки в Авито")
                 if reasons:
                     issues.append(Issue("%s:%s" % (product.key, item.item_id), product, row, item, tuple(reasons)))
