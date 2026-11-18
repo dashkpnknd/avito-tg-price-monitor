@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlencode
 
-from .monitor import Config, MonitorError, http_text, load_state, save_state
-from .projects import config_for_project, load_projects, project_id, save_projects
+from .monitor import Config, MonitorError, http_text, load_state, replay_saved_report, save_state
+from .projects import all_project_configs, config_for_project, load_projects, project_id, save_projects
 
 
 def spreadsheet_id(value: str) -> Optional[str]:
@@ -71,6 +71,7 @@ class AdminBot:
         return {"inline_keyboard": [
             [{"text": "➕ Добавить проект", "callback_data": "add"}],
             [{"text": "📋 Подключённые проекты", "callback_data": "list"}],
+            [{"text": "🔄 Восстановить отчёты", "callback_data": "replay_confirm"}],
         ]}
 
     @staticmethod
@@ -139,6 +140,30 @@ class AdminBot:
             else:
                 text = "Пока подключён только основной проект, заданный при запуске бота."
             self._send(chat_id, text, self._menu())
+        elif action == "replay_confirm":
+            self._send(chat_id,
+                "Повторно отправить последние сохранённые отчёты во все темы без проверки таблиц и Авито?",
+                {"inline_keyboard": [
+                    [{"text": "✅ Отправить", "callback_data": "replay_all"}],
+                    [{"text": "Отмена", "callback_data": "cancel"}],
+                ]},
+            )
+        elif action == "replay_all":
+            sent_projects = 0
+            sent_messages = 0
+            unavailable = []
+            for project_config in all_project_configs(self.config):
+                try:
+                    sent = replay_saved_report(project_config)
+                except MonitorError:
+                    unavailable.append(project_config.project_name)
+                    continue
+                sent_projects += 1
+                sent_messages += sent
+            result = "Восстановлены отчёты: %s проектов, %s сообщений." % (sent_projects, sent_messages)
+            if unavailable:
+                result += "\nНет свежего сохранённого отчёта: %s." % ", ".join(html.escape(name) for name in unavailable)
+            self._send(chat_id, result, self._menu())
         elif action.startswith("delay:") and user_id in sessions:
             hours = action.split(":", 1)[1]
             if hours in {"3", "5", "8"}:

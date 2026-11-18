@@ -28,6 +28,7 @@ from app.monitor import (
     parse_phone_title,
     product_matches,
     matching_client_products,
+    replay_saved_report,
     unmatched_client_note,
     load_state,
 )
@@ -79,6 +80,43 @@ class MatchingTests(unittest.TestCase):
                 sent.assert_called_once()
                 deleted.assert_called_once_with(monitor.config, 42)
             self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
+
+    def test_replays_saved_report_without_a_new_price_check(self):
+        issue = self.notification_issue()
+        checked = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=checked), patch(
+                "app.monitor.send_telegram", return_value=42
+            ) as first_send:
+                monitor._notify([issue], force_notify=True)
+            original_text = first_send.call_args.args[1]
+            with patch("app.monitor.now_utc", return_value=checked + timedelta(minutes=10)), patch(
+                "app.monitor.send_telegram", return_value=43
+            ) as replay_send, patch("app.monitor.delete_telegram") as deleted, patch(
+                "app.monitor.fetch_active_avito_items", side_effect=AssertionError("Avito must not be queried")
+            ):
+                self.assertEqual(1, replay_saved_report(monitor.config))
+            self.assertEqual(original_text, replay_send.call_args.args[1])
+            deleted.assert_called_once_with(monitor.config, 42)
+            meta = load_state(monitor.config.state_path)["__monitor__"]
+            self.assertEqual(["43"], meta["report_message_ids"])
+            self.assertEqual([original_text], meta["report_messages"])
+
+    def test_does_not_replay_an_outdated_report(self):
+        checked = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=checked), patch(
+                "app.monitor.send_telegram", return_value=42
+            ):
+                monitor._notify([], force_notify=True)
+            with patch("app.monitor.now_utc", return_value=checked + timedelta(hours=4)), patch(
+                "app.monitor.send_telegram"
+            ) as sent:
+                with self.assertRaises(MonitorError):
+                    replay_saved_report(monitor.config)
+                sent.assert_not_called()
 
     def test_leaves_an_old_report_when_telegram_refuses_deletion(self):
         issue = self.notification_issue()

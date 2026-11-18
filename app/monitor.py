@@ -1256,6 +1256,41 @@ def report_message_ids(meta: Dict[str, str]) -> List[int]:
     return result
 
 
+def cached_report_messages(meta: Dict[str, str]) -> List[str]:
+    values = meta.get("report_messages")
+    if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
+        return []
+    return values
+
+
+def replay_saved_report(config: Config) -> int:
+    """Repost the last checked report without reading Sheets or Avito."""
+    lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_state(config.state_path)
+            meta = state.get("__monitor__", {})
+            if not isinstance(meta, dict):
+                raise MonitorError("No saved report for %s" % config.project_name)
+            messages = cached_report_messages(meta)
+            checked_at = str(meta.get("last_checked_at", ""))
+            if not messages or not checked_at:
+                raise MonitorError("No saved report for %s" % config.project_name)
+            if now_utc() - parse_timestamp(checked_at) > timedelta(minutes=config.check_interval_minutes * 3):
+                raise MonitorError("Saved report is too old for %s" % config.project_name)
+            active_ids, sent = replace_telegram_report(config, report_message_ids(meta), messages)
+            if active_ids:
+                meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
+                meta.pop("report_message_id", None)
+                meta["last_digest_at"] = now_utc().isoformat()
+                save_state(config.state_path, state)
+            return sent
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def replace_telegram_report(
     config: Config,
     previous_ids: Sequence[int],
@@ -1377,6 +1412,7 @@ class Monitor:
         if not isinstance(meta, dict):
             meta = {}
             state["__monitor__"] = meta
+        meta["last_checked_at"] = current.isoformat()
         current_keys = {issue.key for issue in issues}
         due: List[Tuple[Issue, Dict[str, str], timedelta]] = []
         for issue in issues:
@@ -1433,10 +1469,19 @@ class Monitor:
                 if active_ids:
                     meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
                     meta.pop("report_message_id", None)
+                    meta["report_messages"] = messages
                 meta["report_signature"] = signature
                 meta["report_format_version"] = "2"
                 meta["last_digest_at"] = current.isoformat()
                 alerts_sent += new_messages
+            elif previous_message_ids and not cached_report_messages(meta):
+                # Upgrade state files written before report bodies were kept.
+                meta["report_messages"] = issue_digests(
+                    self.config.project_name,
+                    [issue for issue, _, _ in due],
+                    self.config.mismatch_grace,
+                    current,
+                )
             for _, entry, _ in due:
                 entry["notified"] = "true"
 
@@ -1456,16 +1501,22 @@ class Monitor:
         # afterwards refresh it once per Moscow calendar day.
         if not issues and (previous_signature != "ok" or meta.get("report_format_version") != "2" or morning_report_due(meta, current)):
             if previous_message_ids or current.astimezone(timezone(timedelta(hours=3))).hour >= 9:
+                message = "🏪 <b>%s</b>\n\n✅ Всё в порядке, расхождений цен нет." % html.escape(self.config.project_name)
                 active_ids, new_messages = replace_telegram_report(
                     self.config, previous_message_ids,
-                    ["🏪 <b>%s</b>\n\n✅ Всё в порядке, расхождений цен нет." % html.escape(self.config.project_name)],
+                    [message],
                 )
                 if active_ids:
                     meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
+                    meta["report_messages"] = [message]
                 meta["report_signature"] = "ok"
                 meta["report_format_version"] = "2"
                 meta["last_digest_at"] = current.isoformat()
                 alerts_sent += new_messages
+        elif not issues and previous_signature == "ok" and previous_message_ids and not cached_report_messages(meta):
+            meta["report_messages"] = [
+                "🏪 <b>%s</b>\n\n✅ Всё в порядке, расхождений цен нет." % html.escape(self.config.project_name)
+            ]
         elif not due and previous_message_ids and issues:
             for previous_message_id in previous_message_ids:
                 try:
@@ -1480,5 +1531,6 @@ class Monitor:
             meta.pop("report_message_id", None)
             meta.pop("report_signature", None)
             meta.pop("last_digest_at", None)
+            meta.pop("report_messages", None)
         save_state(self.config.state_path, state)
         return alerts_sent, len(resolved_keys)
