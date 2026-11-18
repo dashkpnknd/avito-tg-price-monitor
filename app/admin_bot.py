@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from urllib.parse import urlencode
 
 from .monitor import Config, MonitorError, http_text, load_state, save_state
-from .projects import load_projects, project_id, save_projects
+from .projects import config_for_project, load_projects, project_id, save_projects
 
 
 def spreadsheet_id(value: str) -> Optional[str]:
@@ -107,7 +107,7 @@ class AdminBot:
             "👤 Клиентская таблица: подключена\n"
             "📥 Автозагрузка: подключена\n"
             "🕐 Задержка: %s ч.\n\n"
-            "После подтверждения бот начнёт проверять его в течение часа."
+            "После подтверждения бот создаст тему в группе и начнёт проверять проект в течение часа."
         ) % (html.escape(str(data["name"])), data["delay_hours"])
         keyboard = {"inline_keyboard": [
             [{"text": "✅ Подключить", "callback_data": "confirm"}],
@@ -150,6 +150,24 @@ class AdminBot:
             required = {"name", "client_spreadsheet_id", "autoload_spreadsheet_id", "avito_client_id", "avito_client_secret", "delay_hours"}
             if required.issubset(data):
                 data["id"] = project_id(str(data["name"]), str(data["client_spreadsheet_id"]))
+                project_config = config_for_project(self.config, data)
+                topics_path = self.config.state_path.parent / "telegram-topics.json"
+                topics = load_state(topics_path)
+                if project_config.state_path.name not in topics:
+                    try:
+                        response = self._api("createForumTopic", {
+                            "chat_id": self.config.telegram_chat_id,
+                            "name": str(data["name"])[:128],
+                        })
+                        topic = response.get("result")
+                        topic_id = topic.get("message_thread_id") if isinstance(topic, dict) else None
+                        if not isinstance(topic_id, int) or topic_id <= 0:
+                            raise MonitorError("Telegram did not return a topic ID")
+                        topics[project_config.state_path.name] = topic_id
+                        save_state(topics_path, topics)
+                    except MonitorError:
+                        self._send(chat_id, "Не удалось создать тему в группе. Проверь права бота на управление темами и повтори подключение.")
+                        return
                 projects = [item for item in load_projects(self.config) if item.get("id") != data["id"]]
                 projects.append(data)
                 save_projects(self.config, projects)

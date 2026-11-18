@@ -107,10 +107,10 @@ class MatchingTests(unittest.TestCase):
                 monitor._notify([issue])
             with patch("app.monitor.now_utc", return_value=started + timedelta(hours=6)), patch(
                 "app.monitor.delete_telegram"
-            ) as deleted:
+            ) as deleted, patch("app.monitor.send_telegram", return_value=43):
                 monitor._notify([])
                 deleted.assert_called_once_with(monitor.config, 42)
-            self.assertNotIn("report_message_ids", load_state(monitor.config.state_path)["__monitor__"])
+            self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
 
     def test_manual_report_stays_live_before_the_normal_grace_period(self):
         issue = self.notification_issue()
@@ -418,7 +418,7 @@ class MatchingTests(unittest.TestCase):
             issues = Monitor(None)._find_issues(client, [row], {"123": AvitoItem("123", "Galaxy S25+", 71990, "active", "")})
         self.assertEqual(("цена не дошла из автозагрузки в Авито",), issues[0].reasons)
         self.assertEqual(client[0], issues[0].product)
-        self.assertIn("Клиент: <b>нет текущей цены</b>", issue_example(issues[0]))
+        self.assertIn("Клиент: <b>цена не указана</b>", issue_example(issues[0]))
 
     def test_exact_blank_client_row_beats_fuzzy_priced_sim_candidate(self):
         exact_blank = Product("blank", "Телефоны", 10, {
@@ -522,6 +522,32 @@ class MatchingTests(unittest.TestCase):
         for index in range(4):
             self.assertIn("Товар %s" % index, full_text)
 
+    def test_compact_report_has_only_name_and_three_prices(self):
+        product = Product("pixel", "Телефоны", 2, {"vendor": "Google", "model": "Pixel 11 Pro", "simconfig": "SIM + eSIM", "color": "оранжевый", "memorysize": "1 ТБ", "ramsize": "16 ГБ"}, 115990)
+        row = AutoloadRow("Avito", 3, dict(product.parameters), 105490, "123", "https://www.avito.ru/example")
+        issue = Issue("pixel:123", product, row, AvitoItem("123", "Pixel 11 Pro", 105490, "active", ""), ("цена не дошла из клиентской таблицы в автозагрузку",))
+        message = issue_digests("9:41 Калуга", [issue], timedelta(hours=5), datetime(2026, 11, 18, tzinfo=timezone.utc))[0]
+        self.assertIn("🏪 <b>9:41 Калуга</b>", message)
+        self.assertIn("<b>1 позиция</b> не синхронизировалась за 5 ч 0 мин", message)
+        self.assertIn("<b>Google Pixel 11 Pro SIM + eSIM оранжевый 1 ТБ 16 ГБ</b>", message)
+        self.assertIn("👤 Клиент: <b>115 990 ₽</b>", message)
+        self.assertNotIn("Открыть объявление", message)
+        self.assertNotIn("Vendor:", message)
+
+    def test_clean_result_sends_and_refreshes_morning_status(self):
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            morning = datetime(2026, 11, 18, 6, tzinfo=timezone.utc)
+            with patch("app.monitor.now_utc", return_value=morning), patch("app.monitor.send_telegram", return_value=101) as sent:
+                monitor._notify([])
+                self.assertIn("Всё в порядке", sent.call_args.args[1])
+            with patch("app.monitor.now_utc", return_value=morning + timedelta(hours=1)), patch("app.monitor.send_telegram") as sent:
+                monitor._notify([])
+                sent.assert_not_called()
+            with patch("app.monitor.now_utc", return_value=morning + timedelta(days=1)), patch("app.monitor.send_telegram", return_value=102), patch("app.monitor.delete_telegram") as deleted:
+                monitor._notify([])
+                deleted.assert_called_once_with(monitor.config, 101)
+
     def test_skips_a_partial_avito_resource_without_stopping_the_project(self):
         with TemporaryDirectory() as directory:
             config = self.notification_config(directory)
@@ -561,10 +587,10 @@ class MatchingTests(unittest.TestCase):
             ("Нет соответствующей цены в клиентской таблице",),
         )
         card = issue_example(issue)
-        self.assertIn("Клиентская цена: <b>не проверена</b>", card)
+        self.assertIn("Клиент: <b>не проверена</b>", card)
         self.assertNotIn("подходящая строка не сопоставлена", card)
-        self.assertIn("Цвет: <b>серебристый</b>", card)
-        self.assertIn("SIM: <b>Только eSIM</b>", card)
+        self.assertNotIn("Цвет:", card)
+        self.assertNotIn("SIM:", card)
 
     def test_renders_diagnostic_note_for_an_unmatched_client_row(self):
         autoload = AutoloadRow("Avito", 2, {"title": "iPhone", "model": "iPhone 17"}, 100, "123", "")
@@ -574,7 +600,7 @@ class MatchingTests(unittest.TestCase):
             ("Нет соответствующей цены в клиентской таблице",),
             "Возможный кандидат: лист «Телефоны», строка 42. Отличается: SIM.",
         )
-        self.assertIn("Возможный кандидат", issue_example(issue))
+        self.assertNotIn("Возможный кандидат", issue_example(issue))
 
     def test_unmatched_diagnostic_does_not_claim_client_product_is_absent(self):
         row = AutoloadRow("Avito - Смарт-часы", 69, {"title": "Samsung Galaxy Watch 9 44mm Silver"}, 25990, "123", "")

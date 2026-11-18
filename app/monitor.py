@@ -1153,40 +1153,23 @@ def delete_telegram(config: Config, message_id: int) -> None:
 
 
 def issue_example(issue: Issue) -> str:
-    """A scan-friendly example card within a project digest."""
-    title = issue.product.title or format_parameters(issue.product.parameters)
+    """Show the product and the three prices, without technical field labels."""
+    parameters = issue.autoload.parameters if issue.autoload else issue.product.parameters
+    title = issue.product.title or parameters.get("title", "")
+    if not title:
+        vendor = parameters.get("vendor", "")
+        model = parameters.get("model", "")
+        if vendor and normalized(model).startswith(normalized(vendor)):
+            vendor = ""
+        parts = [vendor, model] + [parameters.get(name, "") for name in ("simconfig", "color", "memorysize", "ramsize")]
+        title = " ".join(part for part in parts if part) or (issue.avito.title if issue.avito else "")
     lines = ["<b>%s</b>" % html.escape(title)]
-    if issue.product.source_name == "Авито":
-        lines.extend((
-            "📥 Автозагрузка: <b>строка не найдена</b>",
-            "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
-        ))
-    elif issue.product.source_name == "Автозагрузка":
-        parameters = issue.autoload.parameters if issue.autoload else {}
-        color = parameters.get("color", "")
-        sim_config = parameters.get("simconfig", "")
-        if color:
-            lines.append("🎨 Цвет: <b>%s</b>" % html.escape(color))
-        if sim_config:
-            lines.append("📱 SIM: <b>%s</b>" % html.escape(sim_config))
-        lines.extend((
-            "👤 Клиентская цена: <b>не проверена</b>",
-            "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
-            "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
-        ))
-        if issue.match_note:
-            lines.append("🔎 %s" % html.escape(issue.match_note))
-        if issue.match_category != "price_mismatch":
-            lines.append("🏷 <b>%s</b>" % html.escape(MATCH_CATEGORY_LABELS.get(issue.match_category, issue.match_category)))
-    else:
-        lines.extend((
-            "👤 Клиент: <b>%s</b>" % html.escape(format_price(issue.product.price) if issue.product.price is not None else "нет текущей цены"),
-            "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
-            "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
-        ))
-    url = (issue.autoload.url if issue.autoload and issue.autoload.url else issue.avito.url if issue.avito else "")
-    if url.startswith(("https://", "http://")):
-        lines.append('🔗 <a href="%s">Открыть объявление</a>' % html.escape(url, quote=True))
+    client_price = format_price(issue.product.price) if issue.product.source_name not in {"Автозагрузка", "Авито"} else "не проверена"
+    lines.extend((
+        "👤 Клиент: <b>%s</b>" % html.escape(client_price),
+        "📥 Автозагрузка: <b>%s</b>" % html.escape(format_price(issue.autoload.price if issue.autoload else None)),
+        "📣 Авито: <b>%s</b>" % html.escape(format_price(issue.avito.price if issue.avito else None)),
+    ))
     return "\n".join(lines)
 
 
@@ -1206,49 +1189,17 @@ def issue_digests(
     limit: int = 3900,
 ) -> List[str]:
     """Return the complete project report, split only at Telegram's hard limit."""
-    client_to_autoload = sum(
-        "цена не дошла из клиентской таблицы в автозагрузку" in issue.reasons for issue in issues
-    )
-    autoload_to_avito = sum(
-        "цена не дошла из автозагрузки в Авито" in issue.reasons for issue in issues
-    )
-    missing = sum(any(
-        marker in reason.casefold()
-        for reason in issue.reasons
-        for marker in ("не найдено", "нет id", "не активно", "нет соответствующей")
-    ) for issue in issues)
     lines = [
-        "⚠️ <b>Проверь цены</b>",
         "🏪 <b>%s</b>" % html.escape(project_name),
-        "🕐 <b>Проверка:</b> %s МСК" % checked_at.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m, %H:%M"),
         "",
-        "<b>%s %s</b> не синхронизировались за %s." % (len(issues), position_word(len(issues)), format_duration(grace)),
+        "<b>%s %s</b> %s за %s." % (
+            len(issues), position_word(len(issues)),
+            "не синхронизировалась" if len(issues) % 10 == 1 and len(issues) % 100 != 11 else "не синхронизировались",
+            format_duration(grace),
+        ),
     ]
-    stages: List[str] = []
-    if client_to_autoload:
-        stages.append("👤 Клиентская таблица → автозагрузка: <b>%s</b>" % client_to_autoload)
-    if autoload_to_avito:
-        stages.append("📥 Автозагрузка → Авито: <b>%s</b>" % autoload_to_avito)
-    if missing:
-        stages.append("🔗 Нет строки или активного объявления: <b>%s</b>" % missing)
-    if stages:
-        lines.extend(("", "📍 <b>Где не обновилось</b>", *stages))
-    categories = {}
-    for issue in issues:
-        if issue.match_category != "price_mismatch":
-            categories[issue.match_category] = categories.get(issue.match_category, 0) + 1
-    if categories:
-        lines.extend(("", "🧭 <b>Несопоставленные товары</b>"))
-        for category, count in sorted(categories.items()):
-            lines.append("• %s: <b>%s</b>" % (MATCH_CATEGORY_LABELS.get(category, category), count))
-    lines.extend(("", "📋 <b>Что проверить</b>"))
     heading = "\n".join(lines)
-    continuation = "\n".join((
-        "⚠️ <b>Проверь цены</b>",
-        "🏪 <b>%s</b>" % html.escape(project_name),
-        "",
-        "📋 <b>Что проверить, продолжение</b>",
-    ))
+    continuation = "🏪 <b>%s</b> (продолжение)" % html.escape(project_name)
     batches: List[str] = []
     current = heading
     for issue in issues:
@@ -1276,6 +1227,15 @@ def issue_signature(issues: Sequence[Issue]) -> str:
         ))
     encoded = json.dumps(sorted(items), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def morning_report_due(meta: Dict[str, str], current: datetime) -> bool:
+    """One fresh report per Moscow calendar day, after 09:00."""
+    local = current.astimezone(timezone(timedelta(hours=3)))
+    if local.hour < 9:
+        return False
+    previous = str(meta.get("last_digest_at", ""))
+    return not previous or parse_timestamp(previous).astimezone(timezone(timedelta(hours=3))).date() < local.date()
 
 
 def report_message_ids(meta: Dict[str, str]) -> List[int]:
@@ -1449,9 +1409,11 @@ class Monitor:
             needs_refresh = (
                 manual_refresh
                 or
+                meta.get("report_format_version") != "2"
+                or
                 previous_signature != signature
                 or last_digest is None
-                or current - last_digest >= self.config.notification_repeat
+                or morning_report_due(meta, current)
             )
             # A message created by a version before this change has no stored
             # ID, so leave it alone until its normal repeat window expires.
@@ -1469,6 +1431,7 @@ class Monitor:
                     meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
                     meta.pop("report_message_id", None)
                 meta["report_signature"] = signature
+                meta["report_format_version"] = "2"
                 meta["last_digest_at"] = current.isoformat()
                 alerts_sent += new_messages
             for _, entry, _ in due:
@@ -1485,10 +1448,22 @@ class Monitor:
                 resolved_keys.append(key)
             del state[key]
 
-        # When the problem is fixed, remove its last report if Telegram allows
-        # it. An old message that cannot be deleted is intentionally left as
-        # is; the bot never rewrites historical reports.
-        if not due and previous_message_ids:
+        # A clean check replaces the prior report with a short confirmation.
+        # Before the morning window, send it on the first clean transition;
+        # afterwards refresh it once per Moscow calendar day.
+        if not issues and (previous_signature != "ok" or meta.get("report_format_version") != "2" or morning_report_due(meta, current)):
+            if previous_message_ids or current.astimezone(timezone(timedelta(hours=3))).hour >= 9:
+                active_ids, new_messages = replace_telegram_report(
+                    self.config, previous_message_ids,
+                    ["🏪 <b>%s</b>\n\n✅ Всё в порядке, расхождений цен нет." % html.escape(self.config.project_name)],
+                )
+                if active_ids:
+                    meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
+                meta["report_signature"] = "ok"
+                meta["report_format_version"] = "2"
+                meta["last_digest_at"] = current.isoformat()
+                alerts_sent += new_messages
+        elif not due and previous_message_ids and issues:
             for previous_message_id in previous_message_ids:
                 try:
                     delete_telegram(self.config, previous_message_id)
