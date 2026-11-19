@@ -8,6 +8,7 @@ bindings are stored in `data/telegram-topics.json` on the same server.
 | --- | --- | --- | --- | --- |
 | 2026-11-13 | APPHUB \| Екатеринбург | Телефоны, Макбуки, Айпады, Часы, Наушники, ПС, Дайсон | 5 hours | 3287 |
 | 2026-11-13 | KingStore Екатеринбург | Телефоны, Макбуки, Айпады, Часы, Наушники, ПС, Дайсон | 5 hours | 3288 |
+| 2026-11-19 | Йошкар-Ола | Все листы прайса с ценой | 5 hours | 3781 |
 
-Both projects use the regular hourly scheduler. Their first check was not
-triggered manually during onboarding.
+These projects use the regular hourly scheduler. Avito credentials stay in the
+server registry and are not committed to Git.
