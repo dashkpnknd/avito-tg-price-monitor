@@ -62,7 +62,7 @@ class MatchingTests(unittest.TestCase):
         avito = AvitoItem("123", "iPhone", 90, "active", "")
         return Issue("product:123", product, autoload, avito, ("цена не дошла из клиентской таблицы в автозагрузку",))
 
-    def test_pending_card_becomes_confirmed_and_refreshes_next_morning(self):
+    def test_unconfirmed_issue_stays_out_of_report_until_grace_period(self):
         issue = self.notification_issue()
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
@@ -71,7 +71,7 @@ class MatchingTests(unittest.TestCase):
                 "app.monitor.send_telegram", return_value=42
             ) as sent:
                 monitor._notify([issue])
-                self.assertIn("Проверяем", sent.call_args.args[1])
+                self.assertIn("подтверждённых расхождений цен нет", sent.call_args.args[1])
             with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
                 "app.monitor.edit_telegram"
             ) as edited, patch("app.monitor.send_telegram") as sent:
@@ -123,7 +123,7 @@ class MatchingTests(unittest.TestCase):
                     replay_saved_report(monitor.config)
                 sent.assert_not_called()
 
-    def test_pending_card_is_reused_then_cleared_when_issue_disappears(self):
+    def test_unconfirmed_issue_keeps_the_all_clear_card(self):
         issue = self.notification_issue()
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
@@ -143,7 +143,7 @@ class MatchingTests(unittest.TestCase):
             ) as sent, patch("app.monitor.edit_telegram") as edited:
                 monitor._notify([])
                 sent.assert_not_called()
-                self.assertIn("Всё в порядке", edited.call_args.args[2])
+                edited.assert_not_called()
             meta = load_state(monitor.config.state_path)["__monitor__"]
             self.assertEqual(["42"], meta["report_message_ids"])
             self.assertEqual("ok", meta["report_signature"])
