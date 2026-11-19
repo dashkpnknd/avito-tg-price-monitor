@@ -29,6 +29,7 @@ from app.monitor import (
     product_matches,
     matching_client_products,
     replay_saved_report,
+    replace_telegram_report,
     unmatched_client_note,
     load_state,
 )
@@ -132,7 +133,7 @@ class MatchingTests(unittest.TestCase):
                 deleted.assert_called_once_with(monitor.config, 42)
             self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
 
-    def test_removes_the_card_when_the_issue_is_resolved(self):
+    def test_edits_the_card_when_the_issue_is_resolved(self):
         issue = self.notification_issue()
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
@@ -145,10 +146,48 @@ class MatchingTests(unittest.TestCase):
                 monitor._notify([issue])
             with patch("app.monitor.now_utc", return_value=started + timedelta(hours=6)), patch(
                 "app.monitor.delete_telegram"
-            ) as deleted, patch("app.monitor.send_telegram", return_value=43):
+            ) as deleted, patch("app.monitor.send_telegram") as sent, patch(
+                "app.monitor.edit_telegram"
+            ) as edited:
                 monitor._notify([])
-                deleted.assert_called_once_with(monitor.config, 42)
-            self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
+                deleted.assert_not_called()
+                sent.assert_not_called()
+                self.assertEqual(42, edited.call_args.args[1])
+                self.assertIn("Всё в порядке", edited.call_args.args[2])
+            self.assertEqual(["42"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
+
+    def test_message_count_can_grow_and_shrink_without_duplicate_cards(self):
+        with TemporaryDirectory() as directory:
+            config = self.notification_config(directory)
+            with patch("app.monitor.edit_telegram") as edited, patch(
+                "app.monitor.send_telegram", side_effect=[102, 103]
+            ) as sent, patch("app.monitor.delete_telegram") as deleted:
+                ids, changed = replace_telegram_report(config, [101], ["A changed", "B", "C"], ["A old"])
+                self.assertEqual([101, 102, 103], ids)
+                self.assertEqual(3, changed)
+                edited.assert_called_once_with(config, 101, "A changed")
+                self.assertEqual(2, sent.call_count)
+                deleted.assert_not_called()
+            with patch("app.monitor.edit_telegram") as edited, patch("app.monitor.send_telegram") as sent, patch(
+                "app.monitor.delete_telegram"
+            ) as deleted:
+                ids, changed = replace_telegram_report(config, [101, 102, 103], ["A newest"], ["A changed", "B", "C"])
+                self.assertEqual([101], ids)
+                self.assertEqual(1, changed)
+                edited.assert_called_once_with(config, 101, "A newest")
+                sent.assert_not_called()
+                self.assertEqual([102, 103], [call.args[1] for call in deleted.call_args_list])
+
+    def test_partial_growth_cleans_up_new_cards_and_restores_old_text(self):
+        with TemporaryDirectory() as directory:
+            config = self.notification_config(directory)
+            with patch("app.monitor.edit_telegram") as edited, patch(
+                "app.monitor.send_telegram", side_effect=[102, MonitorError("send failed")]
+            ), patch("app.monitor.delete_telegram") as deleted:
+                with self.assertRaises(MonitorError):
+                    replace_telegram_report(config, [101], ["A changed", "B", "C"], ["A old"])
+                self.assertEqual(["A changed", "A old"], [call.args[2] for call in edited.call_args_list])
+                deleted.assert_called_once_with(config, 102)
 
     def test_manual_report_stays_live_before_the_normal_grace_period(self):
         issue = self.notification_issue()
@@ -547,7 +586,7 @@ class MatchingTests(unittest.TestCase):
 
     def test_splits_a_full_report_without_dropping_items(self):
         issues = []
-        for index in range(4):
+        for index in range(12):
             title = "Товар %s %s" % (index, "x" * 1100)
             product = Product("product-%s" % index, "Телефоны (авито)", index + 2, {"title": title}, 100)
             autoload = AutoloadRow("Avito", index + 2, {"title": title}, 90, str(index), "")
@@ -557,7 +596,7 @@ class MatchingTests(unittest.TestCase):
         self.assertGreater(len(batches), 1)
         self.assertTrue(all(len(batch) <= 3900 for batch in batches))
         full_text = "\n".join(batches)
-        for index in range(4):
+        for index in range(12):
             self.assertIn("Товар %s" % index, full_text)
 
     def test_compact_report_has_only_name_and_three_prices(self):

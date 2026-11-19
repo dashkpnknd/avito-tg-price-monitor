@@ -1152,6 +1152,19 @@ def delete_telegram(config: Config, message_id: int) -> None:
     })
 
 
+def edit_telegram(config: Config, message_id: int, text: str) -> None:
+    if config.dry_run:
+        logging.info("DRY RUN Telegram message edit %s:\n%s", message_id, text)
+        return
+    telegram_request(config, "editMessageText", {
+        "chat_id": config.telegram_chat_id,
+        "message_id": str(message_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    })
+
+
 def issue_example(issue: Issue) -> str:
     """Show the product and the three prices, without technical field labels."""
     parameters = issue.autoload.parameters if issue.autoload else issue.product.parameters
@@ -1166,6 +1179,8 @@ def issue_example(issue: Issue) -> str:
     # Some source Title cells contain the whole ad text after the product name.
     # The first non-empty line is the concise listing title.
     title = next((line.strip() for line in html.unescape(title).splitlines() if line.strip()), "Товар")
+    if len(title) > 300:
+        title = title[:299].rstrip() + "…"
     lines = ["<b>%s</b>" % html.escape(title)]
     client_price = format_price(issue.product.price) if issue.product.source_name not in {"Автозагрузка", "Авито"} else "не проверена"
     lines.extend((
@@ -1295,19 +1310,56 @@ def replace_telegram_report(
     config: Config,
     previous_ids: Sequence[int],
     messages: Sequence[str],
+    previous_messages: Sequence[str] = (),
 ) -> Tuple[List[int], int]:
-    """Send a fresh report, then remove its previous version where permitted."""
-    active_ids = []
-    for text in messages:
-        message_id = send_telegram(config, text)
-        if message_id is not None:
-            active_ids.append(message_id)
-    for previous_id in previous_ids:
+    """Edit existing cards where possible; add or remove cards as count changes."""
+    active_ids: List[int] = []
+    created_ids: List[int] = []
+    edited: List[Tuple[int, str]] = []
+    obsolete_ids: List[int] = []
+    try:
+        for index, body in enumerate(messages):
+            old_id = previous_ids[index] if index < len(previous_ids) else None
+            old_body = previous_messages[index] if index < len(previous_messages) else None
+            if old_id is not None and old_body is not None:
+                if body == old_body:
+                    active_ids.append(old_id)
+                    continue
+                try:
+                    edit_telegram(config, old_id, body)
+                except MonitorError:
+                    # A manually deleted card cannot be edited. Send it again.
+                    obsolete_ids.append(old_id)
+                else:
+                    active_ids.append(old_id)
+                    edited.append((old_id, old_body))
+                    continue
+            elif old_id is not None:
+                # Explicit replay sends new posts, including after a topic was
+                # manually cleared, and retires the old message IDs.
+                obsolete_ids.append(old_id)
+            message_id = send_telegram(config, body)
+            if message_id is not None:
+                active_ids.append(message_id)
+                created_ids.append(message_id)
+    except MonitorError:
+        for message_id, old_body in reversed(edited):
+            try:
+                edit_telegram(config, message_id, old_body)
+            except MonitorError as error:
+                logging.warning("Could not restore prior Telegram card %s: %s", message_id, error)
+        for message_id in created_ids:
+            try:
+                delete_telegram(config, message_id)
+            except MonitorError as error:
+                logging.warning("Could not remove partial Telegram card %s: %s", message_id, error)
+        raise
+    for previous_id in [*obsolete_ids, *previous_ids[len(messages):]]:
         try:
             delete_telegram(config, previous_id)
         except MonitorError as error:
             logging.info("Could not remove previous Telegram report card %s: %s", previous_id, error)
-    return active_ids, len(active_ids)
+    return active_ids, len(created_ids) + len(edited)
 
 
 class Monitor:
@@ -1435,6 +1487,7 @@ class Monitor:
         previous_signature = str(meta.get("report_signature", ""))
         last_digest_value = str(meta.get("last_digest_at", ""))
         last_digest = parse_timestamp(last_digest_value) if last_digest_value else None
+        daily_refresh = morning_report_due(meta, current)
 
         alerts_sent = 0
         if due:
@@ -1452,7 +1505,7 @@ class Monitor:
                 or
                 previous_signature != signature
                 or last_digest is None
-                or morning_report_due(meta, current)
+                or daily_refresh
             )
             # A message created by a version before this change has no stored
             # ID, so leave it alone until its normal repeat window expires.
@@ -1465,7 +1518,10 @@ class Monitor:
                     self.config.mismatch_grace,
                     current,
                 )
-                active_ids, new_messages = replace_telegram_report(self.config, previous_message_ids, messages)
+                active_ids, new_messages = replace_telegram_report(
+                    self.config, previous_message_ids, messages,
+                    () if manual_refresh or daily_refresh else cached_report_messages(meta),
+                )
                 if active_ids:
                     meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
                     meta.pop("report_message_id", None)
@@ -1499,12 +1555,13 @@ class Monitor:
         # A clean check replaces the prior report with a short confirmation.
         # Before the morning window, send it on the first clean transition;
         # afterwards refresh it once per Moscow calendar day.
-        if not issues and (previous_signature != "ok" or meta.get("report_format_version") != "2" or morning_report_due(meta, current)):
+        if not issues and (previous_signature != "ok" or meta.get("report_format_version") != "2" or daily_refresh):
             if previous_message_ids or current.astimezone(timezone(timedelta(hours=3))).hour >= 9:
                 message = "🏪 <b>%s</b>\n\n✅ Всё в порядке, расхождений цен нет." % html.escape(self.config.project_name)
                 active_ids, new_messages = replace_telegram_report(
                     self.config, previous_message_ids,
                     [message],
+                    () if daily_refresh else cached_report_messages(meta),
                 )
                 if active_ids:
                     meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
