@@ -25,6 +25,7 @@ from app.monitor import (
     fetch_active_avito_items,
     issue_example,
     issue_digests,
+    http_text,
     parse_phone_title,
     product_matches,
     matching_client_products,
@@ -690,6 +691,17 @@ class MatchingTests(unittest.TestCase):
             self.assertEqual({}, avito_json("https://example.test/items", {}))
         self.assertEqual(2, request.call_count)
         sleep.assert_called_once_with(90)
+
+    def test_temporary_avito_network_error_is_retried(self):
+        with patch("app.monitor.http_text", side_effect=[MonitorError("Network error for Avito: timed out"), '{}']) as request, patch("app.monitor.time.sleep") as sleep:
+            self.assertEqual({}, avito_json("https://example.test/items", {}))
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once_with(1)
+
+    def test_read_timeout_is_reported_as_a_network_error(self):
+        with patch("app.monitor.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaisesRegex(MonitorError, "Network error"):
+                http_text("https://example.test/items")
 
     def test_unlinked_client_row_does_not_claim_the_product_is_missing(self):
         autoload = AutoloadRow(
