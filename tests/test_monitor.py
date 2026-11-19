@@ -62,18 +62,22 @@ class MatchingTests(unittest.TestCase):
         avito = AvitoItem("123", "iPhone", 90, "active", "")
         return Issue("product:123", product, autoload, avito, ("цена не дошла из клиентской таблицы в автозагрузку",))
 
-    def test_replaces_an_ongoing_report_with_a_new_message(self):
+    def test_pending_card_becomes_confirmed_and_refreshes_next_morning(self):
         issue = self.notification_issue()
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             monitor = Monitor(self.notification_config(directory))
-            with patch("app.monitor.now_utc", return_value=started):
-                monitor._notify([issue])
-            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
+            with patch("app.monitor.now_utc", return_value=started), patch(
                 "app.monitor.send_telegram", return_value=42
             ) as sent:
                 monitor._notify([issue])
-                sent.assert_called_once()
+                self.assertIn("Проверяем", sent.call_args.args[1])
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
+                "app.monitor.edit_telegram"
+            ) as edited, patch("app.monitor.send_telegram") as sent:
+                monitor._notify([issue])
+                edited.assert_called_once()
+                sent.assert_not_called()
             with patch("app.monitor.now_utc", return_value=started + timedelta(hours=29)), patch(
                 "app.monitor.send_telegram", return_value=43
             ) as sent, patch("app.monitor.delete_telegram") as deleted:
@@ -119,6 +123,31 @@ class MatchingTests(unittest.TestCase):
                     replay_saved_report(monitor.config)
                 sent.assert_not_called()
 
+    def test_pending_card_is_reused_then_cleared_when_issue_disappears(self):
+        issue = self.notification_issue()
+        started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            with patch("app.monitor.now_utc", return_value=started), patch(
+                "app.monitor.send_telegram", return_value=42
+            ):
+                monitor._notify([issue])
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=1)), patch(
+                "app.monitor.send_telegram"
+            ) as sent, patch("app.monitor.edit_telegram") as edited:
+                monitor._notify([issue])
+                sent.assert_not_called()
+                edited.assert_not_called()
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=2)), patch(
+                "app.monitor.send_telegram"
+            ) as sent, patch("app.monitor.edit_telegram") as edited:
+                monitor._notify([])
+                sent.assert_not_called()
+                self.assertIn("Всё в порядке", edited.call_args.args[2])
+            meta = load_state(monitor.config.state_path)["__monitor__"]
+            self.assertEqual(["42"], meta["report_message_ids"])
+            self.assertEqual("ok", meta["report_signature"])
+
     def test_leaves_an_old_report_when_telegram_refuses_deletion(self):
         issue = self.notification_issue()
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
@@ -138,13 +167,11 @@ class MatchingTests(unittest.TestCase):
         started = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             monitor = Monitor(self.notification_config(directory))
-            with patch("app.monitor.now_utc", return_value=started):
-                monitor._notify([issue])
-            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
+            with patch("app.monitor.now_utc", return_value=started), patch(
                 "app.monitor.send_telegram", return_value=42
             ):
-                monitor._notify([issue])
-            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=6)), patch(
+                monitor._notify([issue], force_notify=True)
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=1)), patch(
                 "app.monitor.delete_telegram"
             ) as deleted, patch("app.monitor.send_telegram") as sent, patch(
                 "app.monitor.edit_telegram"

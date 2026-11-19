@@ -1574,20 +1574,27 @@ class Monitor:
             meta["report_messages"] = [
                 "🏪 <b>%s</b>\n\n✅ Всё в порядке, расхождений цен нет." % html.escape(self.config.project_name)
             ]
-        elif not due and previous_message_ids and issues:
-            for previous_message_id in previous_message_ids:
-                try:
-                    delete_telegram(self.config, previous_message_id)
-                except MonitorError as error:
-                    logging.info(
-                        "Could not delete resolved Telegram card for %s: %s",
-                        self.config.project_name,
-                        error,
-                    )
-            meta.pop("report_message_ids", None)
-            meta.pop("report_message_id", None)
-            meta.pop("report_signature", None)
-            meta.pop("last_digest_at", None)
-            meta.pop("report_messages", None)
+        elif not due and issues:
+            # A mismatch seen for less than the grace period must not leave an
+            # old "all clear" card in the topic or make the topic empty.
+            message = (
+                "🏪 <b>%s</b>\n\n⏳ Есть новые расхождения. Проверяем, сохранятся ли они %s."
+                % (html.escape(self.config.project_name), format_duration(self.config.mismatch_grace))
+            )
+            if previous_signature != "pending" or not previous_message_ids or daily_refresh:
+                active_ids, changed = replace_telegram_report(
+                    self.config, previous_message_ids, [message],
+                    () if daily_refresh else cached_report_messages(meta),
+                )
+                if active_ids:
+                    meta["report_message_ids"] = [str(message_id) for message_id in active_ids]
+                    meta.pop("report_message_id", None)
+                    meta["report_messages"] = [message]
+                    meta["report_signature"] = "pending"
+                    meta["report_format_version"] = "2"
+                    meta["last_digest_at"] = current.isoformat()
+                alerts_sent += changed
+            elif not cached_report_messages(meta):
+                meta["report_messages"] = [message]
         save_state(self.config.state_path, state)
         return alerts_sent, len(resolved_keys)
