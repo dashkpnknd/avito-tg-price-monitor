@@ -33,6 +33,7 @@ from app.monitor import (
     replace_telegram_report,
     unmatched_client_note,
     load_state,
+    save_state,
 )
 
 
@@ -86,6 +87,33 @@ class MatchingTests(unittest.TestCase):
                 sent.assert_called_once()
                 deleted.assert_called_once_with(monitor.config, 42)
             self.assertEqual(["43"], load_state(monitor.config.state_path)["__monitor__"]["report_message_ids"])
+
+    def test_same_avito_ad_keeps_one_timer_when_client_row_changes(self):
+        row = AutoloadRow("Avito", 2, {"model": "Pixel 11"}, 90, "123", "")
+        active = {"123": AvitoItem("123", "Pixel 11", 90, "active", "")}
+        monitor = Monitor(None)
+        first = monitor._find_issues([Product("old-row", "Телефоны", 2, {"model": "Pixel 11"}, 100)], [row], active)
+        moved = monitor._find_issues([Product("new-row", "Телефоны", 3, {"model": "Pixel 11"}, 100)], [row], active)
+        self.assertEqual("avito:123", first[0].key)
+        self.assertEqual(first[0].key, moved[0].key)
+
+    def test_existing_client_row_timer_migrates_to_avito_ad_id(self):
+        started = datetime(2026, 11, 22, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            monitor = Monitor(self.notification_config(directory))
+            save_state(monitor.config.state_path, {
+                "old-client-row:123": {"first_seen": started.isoformat(), "notified": "false"},
+            })
+            issue = self.notification_issue()
+            issue = Issue("avito:123", issue.product, issue.autoload, issue.avito, issue.reasons)
+            with patch("app.monitor.now_utc", return_value=started + timedelta(hours=5)), patch(
+                "app.monitor.send_telegram", return_value=42
+            ) as sent:
+                monitor._notify([issue])
+                self.assertIn("1 позиция", sent.call_args.args[1])
+            state = load_state(monitor.config.state_path)
+            self.assertNotIn("old-client-row:123", state)
+            self.assertEqual(started.isoformat(), state["avito:123"]["first_seen"])
 
     def test_replays_saved_report_without_a_new_price_check(self):
         issue = self.notification_issue()

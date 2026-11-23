@@ -1388,6 +1388,17 @@ class Monitor:
                 autoload.extend(fetch_avito_autoload_rows(spreadsheet_id))
         active = fetch_active_avito_items(self.config)
         issues = self._find_issues(client, autoload, active)
+        if issues:
+            # Keep per-listing observations in the server log so a later
+            # five-hour alert can be audited across individual checks.
+            observations = [(
+                issue.avito.item_id if issue.avito else "",
+                issue.product.price,
+                issue.autoload.price if issue.autoload else None,
+                issue.avito.price if issue.avito else None,
+            ) for issue in issues]
+            logging.info("Issue observations: project=%s prices=%s", self.config.project_name,
+                         json.dumps(observations, ensure_ascii=False, separators=(",", ":")))
         alerts, resolved = self._notify(issues, force_notify=force_notify)
         return RunSummary(sum(product.price is not None for product in client), len(autoload), len(active), len(issues), alerts, resolved)
 
@@ -1414,7 +1425,7 @@ class Monitor:
                 if row.price is not None and row.price != item.price:
                     reasons.append("цена не дошла из автозагрузки в Авито")
                 if reasons:
-                    issues.append(Issue("%s:%s" % (product.key, item.item_id), product, row, item, tuple(reasons)))
+                    issues.append(Issue("avito:%s" % item.item_id, product, row, item, tuple(reasons)))
                 if product.price is None:
                     unpriced_count += 1
                     if len(unpriced_examples) < 3:
@@ -1433,7 +1444,7 @@ class Monitor:
                         row.price,
                     )
                     issues.append(Issue(
-                        "autoload:%s:avito-price" % item.item_id,
+                        "avito:%s" % item.item_id,
                         autoload_product,
                         row,
                         item,
@@ -1474,6 +1485,20 @@ class Monitor:
         due: List[Tuple[Issue, Dict[str, str], timedelta]] = []
         for issue in issues:
             entry = state.get(issue.key)
+            if not entry:
+                # Older versions keyed the timer by the client row hash. A
+                # reordered or edited row could therefore restart five hours
+                # for the same Avito ad. Carry its timer to the stable ad ID.
+                item_id = issue.avito.item_id if issue.avito else ""
+                legacy_keys = [key for key in state if key != "__monitor__" and key != issue.key
+                               and (key.endswith(":" + item_id) or key == "autoload:%s:avito-price" % item_id)] if item_id else []
+                if legacy_keys:
+                    legacy_entries = [state.pop(key) for key in legacy_keys]
+                    entry = {
+                        "first_seen": min(value["first_seen"] for value in legacy_entries),
+                        "notified": "true" if any(value.get("notified") == "true" for value in legacy_entries) else "false",
+                    }
+                    state[issue.key] = entry
             if not entry:
                 entry = {"first_seen": current.isoformat(), "notified": "false"}
                 state[issue.key] = entry
